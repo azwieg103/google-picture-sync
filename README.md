@@ -158,3 +158,7 @@ For unattended use after authentication, run from the repository directory using
     man -M .venv/share/man google-picture-sync
 
 API references: https://developers.google.com/photos/library/guides/upload-media and https://developers.google.com/drive/api/guides/about-sdk.
+
+## Daily Google Photos quota management
+
+The migration defaults to 9,000 API requests and 67,500 media requests per Pacific calendar day. Counters persist in `.env/migration.sqlite3` across years and restarts. At the local budget, the process waits until 00:05 Pacific the next day. HTTP 429 responses trigger unlimited exponential backoff (60 seconds to one hour, honoring Retry-After). Requests are paced at two-second intervals within each process. Configure `daily_api_budget` and `daily_media_budget` under `[photos]` in `.env/config.ini`. Local counters do not include earlier versions or other clients; the assumed reset time is not guaranteed by Google. Run `bash migrate.sh 2021-2005` to migrate separate yearly albums sequentially. Logs are in `.env/logs/`. Existing verification and cleanup safeguards remain in place.
