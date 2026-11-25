@@ -86,6 +86,7 @@ def main():
     if token.exists() and not set(SCOPES).issubset(json.loads(token.read_text()).get("scopes", [])):
         creds = None
     if creds and creds.expired and creds.refresh_token:
+        print("Refreshing Google OAuth token", flush=True)
         creds.refresh(Request())
     if not creds or not creds.valid:
         if not a.auth:
@@ -119,6 +120,7 @@ def main():
     if a.auth:
         print("Authenticated")
         return
+    print("Connecting to Google Drive and Photos", flush=True)
     drive = build("drive", "v3", credentials=creds)
     http = AuthorizedSession(creds)
     def api(method, endpoint, **kw):
@@ -308,11 +310,13 @@ def main():
         db.close()
         return 1 if totals["unverified"] or not totals["verified"] else 0
     count = 0
+    print("Scanning source year folders", flush=True)
     for folder in sorted(children(root), key=lambda f:f["name"]):
         year = folder["name"]
         if folder["mimeType"] != FOLDER or not re.fullmatch(r"\d{4}", year) or (a.year and year != str(a.year)):
             continue
         album = None
+        print(year, "scanning source media", flush=True)
         for f in walk(folder["id"]):
             id, name = f["id"], f["name"]
             row = db.execute("SELECT status,remote FROM media WHERE id=?", (id,)).fetchone()
@@ -324,7 +328,9 @@ def main():
                 if not row[1]:
                     continue
                 try:
+                    print(year, name, "checking existing upload", flush=True)
                     api("GET", "mediaItems/" + row[1])
+                    print(year, name, "existing upload confirmed", flush=True)
                     continue
                 except HTTPError as e:
                     if e.response is None or e.response.status_code != 404:
@@ -338,6 +344,7 @@ def main():
             if a.limit and count >= a.limit:
                 return
             count += 1
+            print(year, name, "starting upload", flush=True)
             try:
                 if album is None:
                     saved = db.execute("SELECT id FROM albums WHERE year=?", (year,)).fetchone()
