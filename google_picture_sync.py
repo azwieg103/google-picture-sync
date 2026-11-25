@@ -213,6 +213,8 @@ def main():
                 yield f
     db.execute("CREATE TABLE IF NOT EXISTS verified_source (source_id TEXT PRIMARY KEY, version TEXT, remote TEXT, policy INTEGER, kind TEXT)")
     db.commit()
+    db.execute("CREATE TABLE IF NOT EXISTS completed_year (year TEXT PRIMARY KEY)")
+    db.commit()
     if a.verify or a.cleanup:
         totals = {"verified": 0, "unverified": 0, "trashed": 0, "exact": 0, "pixel_match": 0, "processed": 0, "folders_trashed": 0, "video_stream_match": 0}
         query = "SELECT year,id,name,status,remote FROM media"
@@ -229,6 +231,9 @@ def main():
         for folder in folders:
             for f in walk(folder["id"]):
                 inventory[(folder["name"], f["id"])] = f
+        if a.year and not inventory and db.execute("SELECT 1 FROM completed_year WHERE year=?", (str(a.year),)).fetchone():
+            print(a.year, "already completed; source inventory empty")
+            return 0
         memberships = {}
         candidates = []
         for year, source_id, name, status, remote in rows:
@@ -347,32 +352,15 @@ def main():
             expected = {f["id"]: f for f in candidates}
             if current.keys() != expected.keys() or any(current[i].get("version") != expected[i].get("version") for i in current):
                 p.error("Source inventory changed; no cleanup performed")
-            trash_batch = []
-            def flush_trash():
-                if not trash_batch:
-                    return
-                failures = []
-                def callback(request_id, response, exception):
-                    if exception or not response or not response.get("trashed"):
-                        failures.append(request_id)
-                    else:
-                        totals["trashed"] += 1
-                        print(a.year, request_id, "trashed")
-                request = drive.new_batch_http_request(callback=callback)
-                for entry in trash_batch:
-                    request.add(drive.files().update(fileId=entry["id"], body={"trashed": True}, fields="id,trashed"), request_id=entry["id"])
-                request.execute()
-                trash_batch.clear()
-                if failures:
-                    p.error("Some trash operations not confirmed; inspect and resume")
             for f in candidates:
                 latest = drive.files().get(fileId=f["id"], fields="version,md5Checksum,trashed").execute()
                 if latest.get("trashed") or latest.get("version") != f["version"] or latest.get("md5Checksum") != f["md5Checksum"]:
                     p.error("Source changed; cleanup stopped")
-                trash_batch.append(f)
-                if len(trash_batch) >= 25:
-                    flush_trash()
-            flush_trash()
+                result = drive.files().update(fileId=f["id"], body={"trashed": True}, fields="id,trashed").execute()
+                if not result.get("trashed"):
+                    p.error("Trash operation not confirmed")
+                totals["trashed"] += 1
+                print(a.year, f["name"], "trashed")
             if list(walk(folders[0]["id"])):
                 p.error("Eligible source files remain; inspect before retrying")
             def prune_empty(parent):
@@ -393,6 +381,8 @@ def main():
                     totals["folders_trashed"] += 1
                     print(a.year, child["name"], "empty folder trashed")
             prune_empty(folders[0]["id"])
+            db.execute("INSERT OR IGNORE INTO completed_year VALUES (?)", (str(a.year),))
+            db.commit()
         print("Verification summary:", totals)
         db.close()
         return 1 if totals["unverified"] or not totals["verified"] else 0
@@ -401,6 +391,9 @@ def main():
     for folder in sorted(children(root), key=lambda f:f["name"]):
         year = folder["name"]
         if folder["mimeType"] != FOLDER or not re.fullmatch(r"\d{4}", year) or (a.year and year != str(a.year)):
+            continue
+        if not (a.scan or a.dry_run) and db.execute("SELECT 1 FROM completed_year WHERE year=?", (year,)).fetchone() and not any(walk(folder["id"])):
+            print(year, "already completed; source inventory empty")
             continue
         album = None
         saved = db.execute("SELECT id FROM albums WHERE year=?", (year,)).fetchone()
