@@ -91,6 +91,26 @@ Confirm the uploaded item in [Google Photos](https://photos.google.com/). The co
 
 See .env.example/config.ini. source_folder is a top-level Drive folder name; source_folder_id optionally overrides it with the ID from its Drive URL. album_prefix is prepended to each year. include_videos accepts true or false. Run from the repository directory so relative paths resolve correctly.
 
+## Basic Drive to Photos migration
+
+Google Drive → Google Photos albums
+
+Each top-level four-digit year folder under Pictures maps to one album of the same year. Photos and videos in nested subfolders are recursively consolidated into that album; Google Photos does not support nested albums.
+
+```bash
+google-picture-sync --dry-run --year 2003
+google-picture-sync --year 2003
+google-picture-sync --verify --year 2003
+google-picture-sync --cleanup --year 2003
+```
+
+1. Preview the source files without uploading.
+2. Copy the year into its corresponding Google Photos album.
+3. Verify the destination media and album membership.
+4. Move verified source files to Google Drive Trash, retaining failed, changed or unverified files.
+
+**Implementation status:** The dry-run and upload commands are available now. The verify and cleanup commands are planned and are not yet implemented. Current migrations never delete source files. Cleanup will require additional Drive OAuth permissions and reauthorization.
+
 ## Usage
 
     google-picture-sync --help
