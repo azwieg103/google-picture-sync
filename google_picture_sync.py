@@ -23,12 +23,18 @@ def main():
     p = argparse.ArgumentParser(description="Copy Drive photos to Google Photos without deleting originals")
     p.add_argument("--config", default=".env/config.ini")
     p.add_argument("--version", action="version", version="0.1.0")
-    g = p.add_mutually_exclusive_group(required=True)
+    g = p.add_mutually_exclusive_group()
     for flag in ("init", "auth", "test", "scan", "dry-run", "all", "resume", "status", "retry-failed"):
         g.add_argument("--" + flag, action="store_true")
-    g.add_argument("--year", type=int)
+    p.add_argument("--year", type=int, help="Restrict to a year; alone, upload that year")
     p.add_argument("--limit", type=int, default=0, help="Maximum new uploads this run (0 unlimited)")
     a = p.parse_args()
+    if not any((a.init, a.auth, a.test, a.scan, a.dry_run, a.all, a.resume, a.status, a.retry_failed, a.year)):
+        p.error("Specify an action or --year")
+    if a.year is not None and not 1000 <= a.year <= 9999:
+        p.error("--year must be a four-digit year")
+    if a.year and any((a.init, a.auth, a.test, a.status)):
+        p.error("--year cannot be combined with --init, --auth, --test or --status")
     if a.limit < 0:
         p.error("--limit must be nonnegative")
     path = Path(a.config)
