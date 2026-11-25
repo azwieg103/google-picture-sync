@@ -123,8 +123,32 @@ def main():
     print("Connecting to Google Drive and Photos", flush=True)
     drive = build("drive", "v3", credentials=creds)
     http = AuthorizedSession(creds)
+    last_request = 0.0
+    def photos_request(method, url, **kw):
+        nonlocal last_request
+        delay = 60
+        while True:
+            time.sleep(max(0, 2.0 - (time.monotonic() - last_request)))
+            last_request = time.monotonic()
+            r = http.request(method, url, **kw)
+            if r.status_code != 429:
+                return r
+            from email.utils import parsedate_to_datetime
+            retry = r.headers.get("Retry-After", "")
+            try:
+                wait = float(retry)
+            except ValueError:
+                try:
+                    wait = parsedate_to_datetime(retry).timestamp() - time.time()
+                except (ValueError, TypeError, OverflowError):
+                    wait = 0
+            wait = max(delay, wait)
+            r.close()
+            print(f"Google Photos rate limit: waiting {wait:.0f} seconds before retry", flush=True)
+            time.sleep(wait)
+            delay = min(delay * 2, 3600)
     def api(method, endpoint, **kw):
-        r = http.request(method, BASE + endpoint, timeout=120, **kw)
+        r = photos_request(method, BASE + endpoint, timeout=120, **kw)
         r.raise_for_status()
         return r.json()
     def listing(q):
@@ -182,20 +206,20 @@ def main():
                     saved = db.execute("SELECT id FROM albums WHERE year=?", (year,)).fetchone()
                     if not saved:
                         raise ValueError("No recorded album")
-                    members = set()
+                    members = {}
                     page = None
                     while True:
                         body = {"albumId": saved[0], "pageSize": 100}
                         if page:
                             body["pageToken"] = page
                         result = api("POST", "mediaItems:search", json=body)
-                        members.update(item["id"] for item in result.get("mediaItems", []))
+                        members.update((item["id"], item) for item in result.get("mediaItems", []))
                         page = result.get("nextPageToken")
                         if not page:
                             break
                     memberships[year] = members
-                item = api("GET", "mediaItems/" + remote)
-                if item.get("id") != remote or remote not in memberships[year]:
+                item = memberships[year].get(remote, {})
+                if item.get("id") != remote:
                     raise ValueError("Destination missing or outside expected album")
                 f = inventory.get((year, source_id))
                 if a.cleanup and f:
@@ -204,7 +228,7 @@ def main():
                     digest = hashlib.md5()
                     suffix = "=dv" if f["mimeType"].startswith("video/") else "=d"
                     with tempfile.TemporaryFile() as dest:
-                        with http.get(item["baseUrl"] + suffix, stream=True, timeout=300) as response:
+                        with photos_request("GET", item["baseUrl"] + suffix, stream=True, timeout=300) as response:
                             response.raise_for_status()
                             for chunk in response.iter_content(1024 * 1024):
                                 digest.update(chunk)
@@ -385,12 +409,12 @@ def main():
                             raise ValueError("Invalid JPEG")
                         comment = ("google-picture-sync recovery " + uuid.uuid4().hex).encode("ascii")
                         payload = original[:2] + b"\xff\xfe" + (len(comment)+2).to_bytes(2,"big") + comment + original[2:]
-                    r = http.post(BASE+"uploads", data=payload, headers={"Content-Type":"application/octet-stream","X-Goog-Upload-Protocol":"raw","X-Goog-Upload-Content-Type":f["mimeType"]}, timeout=300)
+                    r = photos_request("POST", BASE+"uploads", data=payload, headers={"Content-Type":"application/octet-stream","X-Goog-Upload-Protocol":"raw","X-Goog-Upload-Content-Type":f["mimeType"]}, timeout=300)
                     for retry in range(3):
                         if r.status_code not in (429, 500, 502, 503, 504):
                             break
                         time.sleep(2 ** retry)
-                        r = http.post(BASE+"uploads", data=payload, headers={"Content-Type":"application/octet-stream","X-Goog-Upload-Protocol":"raw","X-Goog-Upload-Content-Type":f["mimeType"]}, timeout=300)
+                        r = photos_request("POST", BASE+"uploads", data=payload, headers={"Content-Type":"application/octet-stream","X-Goog-Upload-Protocol":"raw","X-Goog-Upload-Content-Type":f["mimeType"]}, timeout=300)
                     r.raise_for_status()
                     db.execute("INSERT OR REPLACE INTO media VALUES (?,?,?,?,?,?)",(id,year,name,"pending",None,None))
                     db.commit()
