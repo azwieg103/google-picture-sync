@@ -7,6 +7,9 @@ import re
 import sqlite3
 import tempfile
 import uuid
+import subprocess
+import shutil
+import time
 from requests.exceptions import HTTPError
 from PIL import Image, ImageOps, ImageChops
 from pathlib import Path
@@ -22,6 +25,19 @@ SCOPES = ["https://www.googleapis.com/auth/drive.readonly",
           "https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata"]
 BASE = "https://photoslibrary.googleapis.com/v1/"
 FOLDER = "application/vnd.google-apps.folder"
+
+def video_stream_hash(path):
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        raise ValueError("Install ffmpeg and ffprobe for video integrity fallback")
+    probe = subprocess.run(["ffprobe", "-v", "error", "-show_streams", "-of", "json", path], check=True, capture_output=True, text=True, timeout=300)
+    streams = json.loads(probe.stdout)["streams"]
+    if not streams or any(x["codec_type"] not in ("video", "audio") for x in streams):
+        raise ValueError("Unsupported video stream layout")
+    signature = [{k:x.get(k) for k in ("codec_type","codec_name","width","height","sample_rate","channels","time_base","duration_ts","start_pts")} for x in streams]
+    hashes = subprocess.run(["ffmpeg","-v","error","-xerror","-i",path,"-map","0","-c","copy","-f","streamhash","-hash","sha256","-"], check=True, capture_output=True, text=True, timeout=600)
+    if len(hashes.stdout.strip().splitlines()) != len(streams):
+        raise ValueError("Incomplete stream hashes")
+    return signature, hashes.stdout.strip()
 
 def main():
     os.umask(0o077)
@@ -139,7 +155,7 @@ def main():
             elif m.startswith("image/") or (m.startswith("video/") and c["photos"].getboolean("include_videos", True)):
                 yield f
     if a.verify or a.cleanup:
-        totals = {"verified": 0, "unverified": 0, "trashed": 0, "exact": 0, "pixel_match": 0, "processed": 0, "folders_trashed": 0}
+        totals = {"verified": 0, "unverified": 0, "trashed": 0, "exact": 0, "pixel_match": 0, "processed": 0, "folders_trashed": 0, "video_stream_match": 0}
         query = "SELECT year,id,name,status,remote FROM media"
         args = ()
         if a.year:
@@ -222,6 +238,25 @@ def main():
                                         print(year, name, "fallback: processed image accepted; pixels or metadata may differ")
                                     else:
                                         raise ValueError("Image pixels differ; retained")
+                        elif f["mimeType"] == "video/mp4":
+                            with tempfile.TemporaryDirectory() as work:
+                                source_path = os.path.join(work, "source.mp4")
+                                dest_path = os.path.join(work, "destination.mp4")
+                                with open(source_path, "w+b") as src:
+                                    downloader = MediaIoBaseDownload(src, drive.files().get_media(fileId=source_id))
+                                    done = False
+                                    while not done:
+                                        _, done = downloader.next_chunk(num_retries=5)
+                                    src.seek(0)
+                                    if hashlib.md5(src.read()).hexdigest() != f["md5Checksum"]:
+                                        raise ValueError("Source changed during verification")
+                                dest.seek(0)
+                                with open(dest_path, "wb") as out:
+                                    shutil.copyfileobj(dest, out)
+                                if video_stream_hash(source_path) != video_stream_hash(dest_path):
+                                    raise ValueError("Video stream hashes or timing differ; retained")
+                                totals["video_stream_match"] += 1
+                                print(year, name, "fallback: matching encoded video/audio streams")
                         else:
                             raise ValueError("Video bytes differ; retained")
                     candidates.append(f)
@@ -318,14 +353,37 @@ def main():
                     original = tmp.read()
                 if f.get("md5Checksum") and hashlib.md5(original).hexdigest() != f["md5Checksum"]:
                     raise ValueError("Source changed during download")
-                for attempt in range(3 if f["mimeType"] == "image/jpeg" else 1):
+                for attempt in range(3 if f["mimeType"] in ("image/jpeg", "video/mp4") else 1):
                     payload = original
-                    if attempt:
+                    if attempt and f["mimeType"] == "video/mp4":
+                        # Append a valid ISO BMFF free box; no media packets are changed.
+                        if len(original) < 8 or original[4:8] != b"ftyp":
+                            raise ValueError("Unsupported MP4 container")
+                        offset = 0
+                        while offset < len(original):
+                            if offset + 8 > len(original):
+                                raise ValueError("Truncated MP4 box")
+                            size = int.from_bytes(original[offset:offset+4], "big")
+                            header = 8
+                            if size == 1:
+                                size = int.from_bytes(original[offset+8:offset+16], "big")
+                                header = 16
+                            if size < header or offset + size > len(original):
+                                raise ValueError("Unsupported MP4 box size")
+                            offset += size
+                        marker = uuid.uuid4().bytes
+                        payload = original + (8+len(marker)).to_bytes(4,"big") + b"free" + marker
+                    elif attempt:
                         if not original.startswith(b"\xff\xd8"):
                             raise ValueError("Invalid JPEG")
                         comment = ("google-picture-sync recovery " + uuid.uuid4().hex).encode("ascii")
                         payload = original[:2] + b"\xff\xfe" + (len(comment)+2).to_bytes(2,"big") + comment + original[2:]
                     r = http.post(BASE+"uploads", data=payload, headers={"Content-Type":"application/octet-stream","X-Goog-Upload-Protocol":"raw","X-Goog-Upload-Content-Type":f["mimeType"]}, timeout=300)
+                    for retry in range(3):
+                        if r.status_code not in (429, 500, 502, 503, 504):
+                            break
+                        time.sleep(2 ** retry)
+                        r = http.post(BASE+"uploads", data=payload, headers={"Content-Type":"application/octet-stream","X-Goog-Upload-Protocol":"raw","X-Goog-Upload-Content-Type":f["mimeType"]}, timeout=300)
                     r.raise_for_status()
                     db.execute("INSERT OR REPLACE INTO media VALUES (?,?,?,?,?,?)",(id,year,name,"pending",None,None))
                     db.commit()
@@ -344,13 +402,13 @@ def main():
                         if e.response is None or e.response.status_code != 404:
                             raise
                         print(year, name, "destination 404 after upload; attempt", attempt+1)
-                        if attempt == 2 or f["mimeType"] != "image/jpeg":
+                        if attempt == 2 or f["mimeType"] not in ("image/jpeg", "video/mp4"):
                             break
                 print(year,name,db.execute("SELECT status FROM media WHERE id=?",(id,)).fetchone()[0])
             except Exception as e:
                 db.execute("INSERT OR IGNORE INTO media VALUES (?,?,?,?,?,?)",(id,year,name,"failed",None,type(e).__name__))
                 db.commit()
-                print(year,name,"error:",type(e).__name__)
+                print(year,name,"error:",type(e).__name__, str(e))
     db.close()
 
 if __name__ == "__main__":
