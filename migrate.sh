@@ -9,6 +9,7 @@ exec 9>.env/migrate.lock
 flock -n 9 || { echo "Another migration is running." >&2; exit 1; }
 "$sync" --year "$year"
 "$sync" --verify --year "$year"
-"$sync" --cleanup --year "$year"
+"$sync" --cleanup --year "$year" --accept-processed
 "$sync" --verify --year "$year"
+"$sync" --dry-run --year "$year"
 echo "Migration and post-cleanup verification completed for $year."
