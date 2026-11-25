@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONUNBUFFERED=1
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 sync="$PWD/.venv/bin/google-picture-sync"
 [[ -x "$sync" ]] || { echo "Install the application in .venv first." >&2; exit 1; }
