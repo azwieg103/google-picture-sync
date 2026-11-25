@@ -207,6 +207,8 @@ def main():
                 yield from walk(f["id"])
             elif m.startswith("image/") or (m.startswith("video/") and c["photos"].getboolean("include_videos", True)):
                 yield f
+    db.execute("CREATE TABLE IF NOT EXISTS verified_source (source_id TEXT PRIMARY KEY, version TEXT, remote TEXT, policy INTEGER, kind TEXT)")
+    db.commit()
     if a.verify or a.cleanup:
         totals = {"verified": 0, "unverified": 0, "trashed": 0, "exact": 0, "pixel_match": 0, "processed": 0, "folders_trashed": 0, "video_stream_match": 0}
         query = "SELECT year,id,name,status,remote FROM media"
@@ -252,6 +254,16 @@ def main():
                 if a.cleanup and f:
                     if not f.get("md5Checksum") or not f.get("version") or not f.get("capabilities", {}).get("canTrash"):
                         raise ValueError("Source checksum, version or trash permission missing")
+                    cached = db.execute("SELECT kind FROM verified_source WHERE source_id=? AND version=? AND remote=? AND policy=?", (source_id, f["version"], remote, int(a.accept_processed))).fetchone()
+                    if cached:
+                        totals[cached[0]] += 1
+                        candidates.append(f)
+                        totals["verified"] += 1
+                        print(year, name, "verified from checkpoint")
+                        continue
+                    if f["mimeType"].startswith("video/") and item.get("mediaMetadata", {}).get("video", {}).get("status") != "READY":
+                        raise ValueError("Video not ready; retained for next run")
+                    before = {k: totals[k] for k in ("exact", "pixel_match", "processed", "video_stream_match")}
                     digest = hashlib.md5()
                     suffix = "=dv" if f["mimeType"].startswith("video/") else "=d"
                     with tempfile.TemporaryFile() as dest:
@@ -312,6 +324,9 @@ def main():
                                 print(year, name, "fallback: matching encoded video/audio streams")
                         else:
                             raise ValueError("Video bytes differ; retained")
+                    kind = next(k for k in before if totals[k] > before[k])
+                    db.execute("INSERT OR REPLACE INTO verified_source VALUES (?,?,?,?,?)", (source_id, f["version"], remote, int(a.accept_processed), kind))
+                    db.commit()
                     candidates.append(f)
                 totals["verified"] += 1
                 print(year, name, "verified")
@@ -382,6 +397,30 @@ def main():
                 if not page:
                     break
             print(year, "existing album items:", len(existing), flush=True)
+        batch = []
+        def flush_batch():
+            if not batch:
+                return
+            # Persist uncertain submissions before creating remote items.
+            for source_id, filename, upload_token in batch:
+                db.execute("INSERT OR REPLACE INTO media VALUES (?,?,?,?,?,?)", (source_id,year,filename,"pending",None,None))
+            db.commit()
+            results = api("POST","mediaItems:batchCreate",json={"albumId":album,"newMediaItems":[{"simpleMediaItem":{"uploadToken":t,"fileName":n}} for _,n,t in batch]})["newMediaItemResults"]
+            by_token = {x.get("uploadToken"):x for x in results}
+            for source_id, filename, upload_token in batch:
+                result = by_token.get(upload_token)
+                if not result:
+                    print(year, filename, "pending: missing batch result")
+                    continue
+                remote = result.get("mediaItem",{}).get("id")
+                if not result.get("status",{}).get("code",0) and remote:
+                    db.execute("UPDATE media SET status='done',remote=?,error=NULL WHERE id=?", (remote,source_id))
+                    print(year, filename, "done (batch)")
+                else:
+                    db.execute("UPDATE media SET status='failed',error=? WHERE id=?", (str(result.get("status")),source_id))
+                    print(year, filename, "batch failed")
+            db.commit()
+            batch.clear()
         print(year, "scanning source media", flush=True)
         for f in walk(folder["id"]):
             id, name = f["id"], f["name"]
@@ -411,6 +450,7 @@ def main():
             if a.retry_failed and (not row or row[0] != "failed"):
                 continue
             if a.limit and count >= a.limit:
+                flush_batch()
                 return
             count += 1
             print(year, name, "starting upload", flush=True)
@@ -461,6 +501,11 @@ def main():
                         time.sleep(2 ** retry)
                         r = photos_request("POST", BASE+"uploads", data=payload, headers={"Content-Type":"application/octet-stream","X-Goog-Upload-Protocol":"raw","X-Goog-Upload-Content-Type":f["mimeType"]}, timeout=300)
                     r.raise_for_status()
+                    if not recovering:
+                        batch.append((id,name,r.text))
+                        if len(batch) >= 50:
+                            flush_batch()
+                        break
                     db.execute("INSERT OR REPLACE INTO media VALUES (?,?,?,?,?,?)",(id,year,name,"pending",None,None))
                     db.commit()
                     result = api("POST","mediaItems:batchCreate",json={"albumId":album,"newMediaItems":[{"simpleMediaItem":{"uploadToken":r.text,"fileName":name}}]})["newMediaItemResults"][0]
@@ -480,11 +525,13 @@ def main():
                         print(year, name, "destination 404 after upload; attempt", attempt+1)
                         if attempt == 2 or f["mimeType"] not in ("image/jpeg", "video/mp4"):
                             break
-                print(year,name,db.execute("SELECT status FROM media WHERE id=?",(id,)).fetchone()[0])
+                if recovering:
+                    print(year,name,db.execute("SELECT status FROM media WHERE id=?",(id,)).fetchone()[0])
             except Exception as e:
                 db.execute("INSERT OR IGNORE INTO media VALUES (?,?,?,?,?,?)",(id,year,name,"failed",None,type(e).__name__))
                 db.commit()
                 print(year,name,"error:",type(e).__name__, str(e))
+        flush_batch()
     db.close()
 
 if __name__ == "__main__":
