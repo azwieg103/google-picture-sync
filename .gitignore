@@ -5,3 +5,17 @@ __pycache__/
 *.sqlite3
 build/
 *.egg-info/
+
+# Local credentials and OAuth tokens
+/env/
+/.env/
+.env
+.env.*
+!/.env.example/
+credentials.json
+client_secret*.json
+token.json
+token.pickle
+*.sqlite
+*.db
+*.log
