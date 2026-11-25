@@ -137,7 +137,7 @@ def main():
             elif m.startswith("image/") or (m.startswith("video/") and c["photos"].getboolean("include_videos", True)):
                 yield f
     if a.verify or a.cleanup:
-        totals = {"verified": 0, "unverified": 0, "trashed": 0, "exact": 0, "pixel_match": 0, "processed": 0}
+        totals = {"verified": 0, "unverified": 0, "trashed": 0, "exact": 0, "pixel_match": 0, "processed": 0, "folders_trashed": 0}
         query = "SELECT year,id,name,status,remote FROM media"
         args = ()
         if a.year:
@@ -249,6 +249,24 @@ def main():
                 print(a.year, f["name"], "trashed")
             if list(walk(folders[0]["id"])):
                 p.error("Eligible source files remain; inspect before retrying")
+            def prune_empty(parent):
+                for child in list(children(parent)):
+                    if child["mimeType"] != FOLDER:
+                        continue
+                    prune_empty(child["id"])
+                    if any(children(child["id"])):
+                        continue
+                    latest = drive.files().get(fileId=child["id"], fields="parents,trashed,capabilities(canTrash)").execute()
+                    if latest.get("trashed") or parent not in latest.get("parents", []) or not latest.get("capabilities", {}).get("canTrash"):
+                        continue
+                    if any(children(child["id"])):
+                        continue
+                    result = drive.files().update(fileId=child["id"], body={"trashed": True}, fields="id,trashed").execute()
+                    if not result.get("trashed"):
+                        p.error("Empty folder trash operation not confirmed")
+                    totals["folders_trashed"] += 1
+                    print(a.year, child["name"], "empty folder trashed")
+            prune_empty(folders[0]["id"])
         print("Verification summary:", totals)
         db.close()
         return 1 if totals["unverified"] or not totals["verified"] else 0
