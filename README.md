@@ -1,6 +1,6 @@
 # Google Picture Sync
 
-Copy Google Drive year folders into Google Photos albums. Python 3.10+, Linux. Originals are never deleted.
+Copy Google Drive year folders into Google Photos albums. Python 3.10+, Linux. Supports verified migration with recoverable deletion of originals from Drive (move to Trash).
 
 ## Install
 
@@ -36,11 +36,11 @@ If Google reports **Error 403: access_denied** or says the application has not c
 
 The application requests these OAuth scopes (see [Data Access](https://console.cloud.google.com/auth/scopes)):
 
-- `https://www.googleapis.com/auth/drive.readonly`
+- `https://www.googleapis.com/auth/drive` (required for cleanup; read-only tokens support copying only)
 - `https://www.googleapis.com/auth/photoslibrary.appendonly`
 - `https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata`
 
-Drive access is read-only. Photos read access is limited to app-created content.
+Drive write access is requested during authentication so verified originals can be moved to Trash. Photos read access is limited to app-created content.
 
 ### 4. Create desktop OAuth credentials
 
@@ -91,6 +91,25 @@ Confirm the uploaded item in [Google Photos](https://photos.google.com/). The co
 
 See .env.example/config.ini. source_folder is a top-level Drive folder name; source_folder_id optionally overrides it with the ID from its Drive URL. album_prefix is prepended to each year. include_videos accepts true or false. Run from the repository directory so relative paths resolve correctly.
 
+## Recommended yearly migration
+
+After installation and authentication, run:
+
+```bash
+bash migrate.sh
+```
+
+Enter a four-digit year. The wrapper locks against concurrent wrapper runs, scans and uploads missing media, verifies the destination, performs integrity-gated cleanup, verifies Photos again, and displays a final Drive scan. Empty nested folders are moved to Trash; the main year folder and folders containing other files are retained. The wrapper enables `--accept-processed`, which permits a decoded single-frame image with matching dimensions and a confirmed destination ID even if pixels differ. This can lose original quality or metadata. Use manual cleanup without that option for stricter verification.
+
+For existing installations:
+
+```bash
+git pull --ff-only origin main
+python -m pip install --upgrade .
+```
+
+Pillow is installed automatically. Reauthorize with `google-picture-sync --auth` if the existing token lacks Drive write access. Keep `.env/migration.sqlite3` and credentials intact.
+
 ## Basic Drive to Photos migration
 
 Google Drive → Google Photos albums
@@ -102,14 +121,17 @@ google-picture-sync --dry-run --year 2003
 google-picture-sync --year 2003
 google-picture-sync --verify --year 2003
 google-picture-sync --cleanup --year 2003
+google-picture-sync --verify --year 2003
+google-picture-sync --dry-run --year 2003
 ```
 
 1. Preview the source files without uploading.
 2. Copy the year into its corresponding Google Photos album.
 3. Verify the destination media and album membership.
-4. Move verified source files to Google Drive Trash, retaining failed, changed or unverified files.
+4. Compare source and destination bytes by MD5; for single-frame images, fall back to orientation-normalized decoded pixel comparison. Metadata may differ. All eligible source files must pass before trashing begins. Videos require exact bytes.
+5. Trash verified originals and empty nested folders, then verify destination records again and rescan Drive. Trash is recoverable until emptied or expired; never permanently delete through this utility.
 
-**Implementation status:** The dry-run and upload commands are available now. The verify and cleanup commands are planned and are not yet implemented. Current migrations never delete source files. Cleanup will require additional Drive OAuth permissions and reauthorization.
+**Current working status (2026-11-25):** A live 2003 migration completed with 198 destination records verified and zero errors in final verification; the operator confirmed originals appeared removed from Drive. Exact-checksum and identical-pixel fallback have been exercised. Empty-folder cleanup and the latest complete wrapper are implemented but not yet confirmed in a full live run. Cleanup is not transactional: interruption may leave a partially cleaned year. Do not modify source or destination during migration. Final verification checks existence and album membership, not original bytes.
 
 ## Usage
 
@@ -123,10 +145,13 @@ google-picture-sync --cleanup --year 2003
     google-picture-sync --all
     google-picture-sync --resume
     google-picture-sync --retry-failed
+    google-picture-sync --verify --year 2003
+    google-picture-sync --cleanup --year 2003
+    google-picture-sync --cleanup --year 2003 --accept-processed
 
-The program walks four-digit year folders recursively, oldest first, and creates an album per year. Files outside year folders are skipped. Each media creation request contains one item. SQLite records successful uploads by Drive ID. Pending records indicate uncertain outcomes and are deliberately skipped to avoid duplicate uploads; manually inspect Photos before resolving them. Keep the database and credentials together; do not reuse them for another account or source. Existing Photos items cannot be comprehensively deduplicated because of API access restrictions. Do not run multiple instances concurrently. Scan and dry-run do not upload media. The test checks album read access, not upload access. Start with a small real batch. OAuth and API read connectivity have been tested; live uploads still require validation.
+The program walks four-digit year folders recursively, oldest first, and creates an album per year. Files outside year folders are skipped. Each media creation request contains one item. SQLite records successful uploads by Drive ID. Pending records indicate uncertain outcomes and are deliberately skipped to avoid duplicate uploads; manually inspect Photos before resolving them. Keep the database and credentials together; do not reuse them for another account or source. Existing Photos items cannot be comprehensively deduplicated because of API access restrictions. Do not run multiple instances concurrently. Scan and dry-run do not upload media. The test checks album read access, not upload access. Start with a small real batch. OAuth, live uploads, destination verification and media trash cleanup have been exercised. Stale pending records or deleted destination items may require manual reconciliation; back up SQLite before editing records.
 
-For unattended use after authentication, run from the repository directory using the absolute virtual environment executable, with flock to prevent concurrent runs. Review status after each run. Source files remain unchanged.
+For unattended use after authentication, run from the repository directory using the absolute virtual environment executable, with flock to prevent concurrent runs. Review status after each run. Source files remain unchanged unless cleanup is explicitly invoked, including through migrate.sh.
 
 ## Manual
 
