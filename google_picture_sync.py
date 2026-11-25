@@ -1,4 +1,6 @@
 import argparse
+import hashlib
+import json
 import configparser
 import os
 import re
@@ -24,17 +26,19 @@ def main():
     p.add_argument("--config", default=".env/config.ini")
     p.add_argument("--version", action="version", version="0.1.0")
     g = p.add_mutually_exclusive_group()
-    for flag in ("init", "auth", "test", "scan", "dry-run", "all", "resume", "status", "retry-failed", "verify"):
+    for flag in ("init", "auth", "test", "scan", "dry-run", "all", "resume", "status", "retry-failed", "verify", "cleanup"):
         g.add_argument("--" + flag, action="store_true")
     p.add_argument("--year", type=int, help="Restrict to a year; alone, upload that year")
     p.add_argument("--limit", type=int, default=0, help="Maximum new uploads this run (0 unlimited)")
     a = p.parse_args()
-    if not any((a.init, a.auth, a.test, a.scan, a.dry_run, a.all, a.resume, a.status, a.retry_failed, a.verify, a.year)):
+    if not any((a.init, a.auth, a.test, a.scan, a.dry_run, a.all, a.resume, a.status, a.retry_failed, a.verify, a.cleanup, a.year)):
         p.error("Specify an action or --year")
     if a.year is not None and not 1000 <= a.year <= 9999:
         p.error("--year must be a four-digit year")
     if a.year and any((a.init, a.auth, a.test, a.status)):
         p.error("--year cannot be combined with --init, --auth, --test or --status")
+    if a.cleanup and not a.year:
+        p.error("--cleanup requires --year")
     if a.limit < 0:
         p.error("--limit must be nonnegative")
     path = Path(a.config)
@@ -54,7 +58,13 @@ def main():
             print(*row)
         return
     token = Path(c["google"]["token_file"])
+    if a.auth or a.cleanup:
+        SCOPES[0] = "https://www.googleapis.com/auth/drive"
+    elif token.exists() and "https://www.googleapis.com/auth/drive" in json.loads(token.read_text()).get("scopes", []):
+        SCOPES[0] = "https://www.googleapis.com/auth/drive"
     creds = Credentials.from_authorized_user_file(str(token), SCOPES) if token.exists() else None
+    if token.exists() and not set(SCOPES).issubset(json.loads(token.read_text()).get("scopes", [])):
+        creds = None
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
     if not creds or not creds.valid:
@@ -81,7 +91,7 @@ def main():
             }}, SCOPES)
         else:
             flow = InstalledAppFlow.from_client_secrets_file(c["google"]["credentials_file"], SCOPES)
-        creds = flow.run_local_server(port=0)
+        creds = flow.run_local_server(port=0, prompt="consent")
     token.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(token, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
@@ -98,7 +108,7 @@ def main():
     def listing(q):
         page = None
         while True:
-            r = drive.files().list(q=q+" and trashed=false", fields="nextPageToken,files(id,name,mimeType)", pageSize=1000, pageToken=page).execute(num_retries=5)
+            r = drive.files().list(q=q+" and trashed=false", fields="nextPageToken,files(id,name,mimeType,md5Checksum,version,capabilities(canTrash))", pageSize=1000, pageToken=page).execute(num_retries=5)
             yield from r.get("files", [])
             page = r.get("nextPageToken")
             if not page:
@@ -117,15 +127,32 @@ def main():
         api("GET", "albums", params={"pageSize":1})
         print("Photos album read successful; no upload tested")
         return
-    if a.verify:
-        totals = {"verified": 0, "unverified": 0}
+    def walk(id):
+        for f in children(id):
+            m = f["mimeType"]
+            if m == FOLDER:
+                yield from walk(f["id"])
+            elif m.startswith("image/") or (m.startswith("video/") and c["photos"].getboolean("include_videos", True)):
+                yield f
+    if a.verify or a.cleanup:
+        totals = {"verified": 0, "unverified": 0, "trashed": 0}
         query = "SELECT year,id,name,status,remote FROM media"
         args = ()
         if a.year:
             query += " WHERE year=?"
             args = (str(a.year),)
+        rows = list(db.execute(query, args))
+        records = {(year, source_id): (status, remote) for year, source_id, name, status, remote in rows}
+        inventory = {}
+        folders = [f for f in children(root) if f["mimeType"] == FOLDER and re.fullmatch(r"\d{4}", f["name"]) and (not a.year or f["name"] == str(a.year))]
+        if a.year and len(folders) != 1:
+            p.error("Expected exactly one source year folder")
+        for folder in folders:
+            for f in walk(folder["id"]):
+                inventory[(folder["name"], f["id"])] = f
         memberships = {}
-        for year, source_id, name, status, remote in db.execute(query, args):
+        candidates = []
+        for year, source_id, name, status, remote in rows:
             try:
                 if status != "done" or not remote:
                     raise ValueError("No confirmed upload")
@@ -148,21 +175,48 @@ def main():
                 item = api("GET", "mediaItems/" + remote)
                 if item.get("id") != remote or remote not in memberships[year]:
                     raise ValueError("Destination missing or outside expected album")
+                f = inventory.get((year, source_id))
+                if a.cleanup and f:
+                    if not f.get("md5Checksum") or not f.get("version") or not f.get("capabilities", {}).get("canTrash"):
+                        raise ValueError("Source checksum, version or trash permission missing")
+                    digest = hashlib.md5()
+                    suffix = "=dv" if f["mimeType"].startswith("video/") else "=d"
+                    with http.get(item["baseUrl"] + suffix, stream=True, timeout=300) as response:
+                        response.raise_for_status()
+                        for chunk in response.iter_content(1024 * 1024):
+                            digest.update(chunk)
+                    if digest.hexdigest() != f["md5Checksum"]:
+                        raise ValueError("Downloaded Photos bytes differ from Drive; retained")
+                    candidates.append(f)
                 totals["verified"] += 1
-                print(year, name, "verified (existence and album membership)")
+                print(year, name, "verified")
             except Exception as e:
                 totals["unverified"] += 1
-                print(year, name, "unverified:", str(e))
+                print(year, name, "unverified:", type(e).__name__, str(e))
+        for key, f in inventory.items():
+            if key not in records:
+                totals["unverified"] += 1
+                print(key[0], f["name"], "unverified: no migration record")
+        if a.cleanup and not totals["unverified"] and totals["verified"]:
+            # Recheck complete inventory before making any changes.
+            current = {f["id"]: f for f in walk(folders[0]["id"])}
+            expected = {f["id"]: f for f in candidates}
+            if current.keys() != expected.keys() or any(current[i].get("version") != expected[i].get("version") for i in current):
+                p.error("Source inventory changed; no cleanup performed")
+            for f in candidates:
+                latest = drive.files().get(fileId=f["id"], fields="version,md5Checksum,trashed").execute()
+                if latest.get("trashed") or latest.get("version") != f["version"] or latest.get("md5Checksum") != f["md5Checksum"]:
+                    p.error("Source changed; cleanup stopped")
+                result = drive.files().update(fileId=f["id"], body={"trashed": True}, fields="id,trashed").execute()
+                if not result.get("trashed"):
+                    p.error("Trash operation not confirmed")
+                totals["trashed"] += 1
+                print(a.year, f["name"], "trashed")
+            if list(walk(folders[0]["id"])):
+                p.error("Eligible source files remain; inspect before retrying")
         print("Verification summary:", totals)
         db.close()
         return 1 if totals["unverified"] or not totals["verified"] else 0
-    def walk(id):
-        for f in children(id):
-            m = f["mimeType"]
-            if m == FOLDER:
-                yield from walk(f["id"])
-            elif m.startswith("image/") or (m.startswith("video/") and c["photos"].getboolean("include_videos", True)):
-                yield f
     count = 0
     for folder in sorted(children(root), key=lambda f:f["name"]):
         year = folder["name"]
