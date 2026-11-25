@@ -9,6 +9,6 @@ exec 9>.env/migrate.lock
 flock -n 9 || { echo "Another migration is running." >&2; exit 1; }
 "$sync" --year "$year"
 "$sync" --verify --year "$year"
-# Fail closed until the application implements integrity and cleanup safeguards.
-echo "Cleanup blocked: source integrity verification and safe trash support are not implemented." >&2
-exit 1
+"$sync" --cleanup --year "$year"
+"$sync" --verify --year "$year"
+echo "Migration and post-cleanup verification completed for $year."
