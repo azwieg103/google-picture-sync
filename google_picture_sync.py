@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 import tempfile
+from PIL import Image, ImageOps, ImageChops
 from pathlib import Path
 
 from google.auth.transport.requests import AuthorizedSession, Request
@@ -30,6 +31,7 @@ def main():
         g.add_argument("--" + flag, action="store_true")
     p.add_argument("--year", type=int, help="Restrict to a year; alone, upload that year")
     p.add_argument("--limit", type=int, default=0, help="Maximum new uploads this run (0 unlimited)")
+    p.add_argument("--accept-processed", action="store_true", help="Allow processed images with matching dimensions and recorded upload ID even if pixels differ")
     a = p.parse_args()
     if not any((a.init, a.auth, a.test, a.scan, a.dry_run, a.all, a.resume, a.status, a.retry_failed, a.verify, a.cleanup, a.year)):
         p.error("Specify an action or --year")
@@ -135,7 +137,7 @@ def main():
             elif m.startswith("image/") or (m.startswith("video/") and c["photos"].getboolean("include_videos", True)):
                 yield f
     if a.verify or a.cleanup:
-        totals = {"verified": 0, "unverified": 0, "trashed": 0}
+        totals = {"verified": 0, "unverified": 0, "trashed": 0, "exact": 0, "pixel_match": 0, "processed": 0}
         query = "SELECT year,id,name,status,remote FROM media"
         args = ()
         if a.year:
@@ -181,12 +183,45 @@ def main():
                         raise ValueError("Source checksum, version or trash permission missing")
                     digest = hashlib.md5()
                     suffix = "=dv" if f["mimeType"].startswith("video/") else "=d"
-                    with http.get(item["baseUrl"] + suffix, stream=True, timeout=300) as response:
-                        response.raise_for_status()
-                        for chunk in response.iter_content(1024 * 1024):
-                            digest.update(chunk)
-                    if digest.hexdigest() != f["md5Checksum"]:
-                        raise ValueError("Downloaded Photos bytes differ from Drive; retained")
+                    with tempfile.TemporaryFile() as dest:
+                        with http.get(item["baseUrl"] + suffix, stream=True, timeout=300) as response:
+                            response.raise_for_status()
+                            for chunk in response.iter_content(1024 * 1024):
+                                digest.update(chunk)
+                                dest.write(chunk)
+                        if digest.hexdigest() == f["md5Checksum"]:
+                            totals["exact"] += 1
+                        elif f["mimeType"].startswith("image/"):
+                            with tempfile.TemporaryFile() as src:
+                                downloader = MediaIoBaseDownload(src, drive.files().get_media(fileId=source_id))
+                                done = False
+                                while not done:
+                                    _, done = downloader.next_chunk(num_retries=5)
+                                src.seek(0)
+                                check = hashlib.md5()
+                                for chunk in iter(lambda: src.read(1024 * 1024), b""):
+                                    check.update(chunk)
+                                if check.hexdigest() != f["md5Checksum"]:
+                                    raise ValueError("Source changed during verification")
+                                src.seek(0)
+                                dest.seek(0)
+                                with Image.open(src) as original, Image.open(dest) as downloaded:
+                                    if getattr(original, "n_frames", 1) != 1 or getattr(downloaded, "n_frames", 1) != 1:
+                                        raise ValueError("Animated image requires exact checksum")
+                                    left = ImageOps.exif_transpose(original).convert("RGBA")
+                                    right = ImageOps.exif_transpose(downloaded).convert("RGBA")
+                                    if left.size != right.size:
+                                        raise ValueError("Image dimensions differ")
+                                    if all(b.getbbox() is None for b in ImageChops.difference(left, right).split()):
+                                        totals["pixel_match"] += 1
+                                        print(year, name, "fallback: identical decoded pixels; metadata may differ")
+                                    elif a.accept_processed:
+                                        totals["processed"] += 1
+                                        print(year, name, "fallback: processed image accepted; pixels or metadata may differ")
+                                    else:
+                                        raise ValueError("Image pixels differ; retained")
+                        else:
+                            raise ValueError("Video bytes differ; retained")
                     candidates.append(f)
                 totals["verified"] += 1
                 print(year, name, "verified")
