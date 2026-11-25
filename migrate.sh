@@ -33,19 +33,26 @@ done
 (( ${#years[@]} )) || { echo "No years specified." >&2; exit 1; }
 exec 9>.env/migrate.lock
 flock -n 9 || { echo "Another migration is running." >&2; exit 1; }
+umask 077
+mkdir -p .env/logs
+run_id="$(date +%Y%m%d-%H%M%S)-$$"
 for year in "${years[@]}"; do
-    echo "=== Migrating $year ==="
-    if "$sync" --year "$year" &&
-       "$sync" --verify --year "$year" &&
-       "$sync" --cleanup --year "$year" --accept-processed &&
-       "$sync" --verify --year "$year" &&
-       "$sync" --dry-run --year "$year"; then
+    log=".env/logs/migrate-${year}-${run_id}.log"
+    if (
+        echo "=== Migrating $year at $(date -Is) ==="
+        "$sync" --year "$year" &&
+        "$sync" --verify --year "$year" &&
+        "$sync" --cleanup --year "$year" --accept-processed &&
+        "$sync" --verify --year "$year" &&
+        "$sync" --dry-run --year "$year"
+    ) 2>&1 | tee "$log"; then
         passed+=("$year")
-        echo "Migration and post-cleanup verification completed for $year."
+        echo "Migration and post-cleanup verification completed for $year." | tee -a "$log"
     else
         failed+=("$year")
-        echo "Migration incomplete for $year; inspect before retrying. Continuing." >&2
+        echo "Migration incomplete for $year; inspect before retrying. Continuing." | tee -a "$log" >&2
     fi
+    echo "Log: $log"
 done
 echo "=== Migration summary ==="
 echo "Completed: ${passed[*]:-none}"
