@@ -24,12 +24,12 @@ def main():
     p.add_argument("--config", default=".env/config.ini")
     p.add_argument("--version", action="version", version="0.1.0")
     g = p.add_mutually_exclusive_group()
-    for flag in ("init", "auth", "test", "scan", "dry-run", "all", "resume", "status", "retry-failed"):
+    for flag in ("init", "auth", "test", "scan", "dry-run", "all", "resume", "status", "retry-failed", "verify"):
         g.add_argument("--" + flag, action="store_true")
     p.add_argument("--year", type=int, help="Restrict to a year; alone, upload that year")
     p.add_argument("--limit", type=int, default=0, help="Maximum new uploads this run (0 unlimited)")
     a = p.parse_args()
-    if not any((a.init, a.auth, a.test, a.scan, a.dry_run, a.all, a.resume, a.status, a.retry_failed, a.year)):
+    if not any((a.init, a.auth, a.test, a.scan, a.dry_run, a.all, a.resume, a.status, a.retry_failed, a.verify, a.year)):
         p.error("Specify an action or --year")
     if a.year is not None and not 1000 <= a.year <= 9999:
         p.error("--year must be a four-digit year")
@@ -117,6 +117,45 @@ def main():
         api("GET", "albums", params={"pageSize":1})
         print("Photos album read successful; no upload tested")
         return
+    if a.verify:
+        totals = {"verified": 0, "unverified": 0}
+        query = "SELECT year,id,name,status,remote FROM media"
+        args = ()
+        if a.year:
+            query += " WHERE year=?"
+            args = (str(a.year),)
+        memberships = {}
+        for year, source_id, name, status, remote in db.execute(query, args):
+            try:
+                if status != "done" or not remote:
+                    raise ValueError("No confirmed upload")
+                if year not in memberships:
+                    saved = db.execute("SELECT id FROM albums WHERE year=?", (year,)).fetchone()
+                    if not saved:
+                        raise ValueError("No recorded album")
+                    members = set()
+                    page = None
+                    while True:
+                        body = {"albumId": saved[0], "pageSize": 100}
+                        if page:
+                            body["pageToken"] = page
+                        result = api("POST", "mediaItems:search", json=body)
+                        members.update(item["id"] for item in result.get("mediaItems", []))
+                        page = result.get("nextPageToken")
+                        if not page:
+                            break
+                    memberships[year] = members
+                item = api("GET", "mediaItems/" + remote)
+                if item.get("id") != remote or remote not in memberships[year]:
+                    raise ValueError("Destination missing or outside expected album")
+                totals["verified"] += 1
+                print(year, name, "verified (existence and album membership)")
+            except Exception as e:
+                totals["unverified"] += 1
+                print(year, name, "unverified:", str(e))
+        print("Verification summary:", totals)
+        db.close()
+        return 1 if totals["unverified"] or not totals["verified"] else 0
     def walk(id):
         for f in children(id):
             m = f["mimeType"]
@@ -174,4 +213,4 @@ def main():
     db.close()
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
