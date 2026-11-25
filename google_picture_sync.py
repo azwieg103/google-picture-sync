@@ -54,7 +54,28 @@ def main():
     if not creds or not creds.valid:
         if not a.auth:
             p.error("Run --auth interactively first")
-        creds = InstalledAppFlow.from_client_secrets_file(c["google"]["credentials_file"], SCOPES).run_local_server(port=0)
+        envfile = Path("env/.env")
+        if envfile.exists():
+            values = {}
+            for line in envfile.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                key, sep, value = line.removeprefix("export ").partition("=")
+                if sep:
+                    values[key.strip()] = value.strip().strip("'").strip('"')
+            if not values.get("CLIENT_ID") or not values.get("CLIENT_SECRET"):
+                p.error("env/.env must contain CLIENT_ID and CLIENT_SECRET")
+            flow = InstalledAppFlow.from_client_config({"installed": {
+                "client_id": values["CLIENT_ID"],
+                "client_secret": values["CLIENT_SECRET"],
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "redirect_uris": ["http://localhost"]
+            }}, SCOPES)
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(c["google"]["credentials_file"], SCOPES)
+        creds = flow.run_local_server(port=0)
     token.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(token, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
