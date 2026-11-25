@@ -367,6 +367,21 @@ def main():
         if folder["mimeType"] != FOLDER or not re.fullmatch(r"\d{4}", year) or (a.year and year != str(a.year)):
             continue
         album = None
+        saved = db.execute("SELECT id FROM albums WHERE year=?", (year,)).fetchone()
+        existing = set()
+        if saved and not (a.scan or a.dry_run):
+            album = saved[0]
+            page = None
+            while True:
+                body = {"albumId": album, "pageSize": 100}
+                if page:
+                    body["pageToken"] = page
+                result = api("POST", "mediaItems:search", json=body)
+                existing.update(item["id"] for item in result.get("mediaItems", []))
+                page = result.get("nextPageToken")
+                if not page:
+                    break
+            print(year, "existing album items:", len(existing), flush=True)
         print(year, "scanning source media", flush=True)
         for f in walk(folder["id"]):
             id, name = f["id"], f["name"]
@@ -378,10 +393,13 @@ def main():
             if row and row[0] == "done":
                 if not row[1]:
                     continue
+                if row[1] in existing:
+                    print(year, name, "existing upload confirmed by album", flush=True)
+                    continue
                 try:
-                    print(year, name, "checking existing upload", flush=True)
+                    print(year, name, "checking missing album item", flush=True)
                     api("GET", "mediaItems/" + row[1])
-                    print(year, name, "existing upload confirmed", flush=True)
+                    print(year, name, "destination exists outside expected album; retained for review", flush=True)
                     continue
                 except HTTPError as e:
                     if e.response is None or e.response.status_code != 404:
