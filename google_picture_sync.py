@@ -129,6 +129,10 @@ def main():
     quota_zone = ZoneInfo("America/Los_Angeles")
     db.execute("CREATE TABLE IF NOT EXISTS quota_usage (day TEXT, kind TEXT, count INTEGER NOT NULL, PRIMARY KEY(day,kind))")
     db.commit()
+    def remaining_api_budget():
+        day = datetime.now(quota_zone).date().isoformat()
+        row = db.execute("SELECT count FROM quota_usage WHERE day=? AND kind=?", (day,"api")).fetchone()
+        return c.getint("photos","daily_api_budget",fallback=9000) - (row[0] if row else 0)
     def reserve_quota(url):
         kind = "api" if urlsplit(url).hostname == "photoslibrary.googleapis.com" else "media"
         limit = c.getint("photos", "daily_api_budget" if kind == "api" else "daily_media_budget", fallback=9000 if kind == "api" else 67500)
@@ -343,15 +347,32 @@ def main():
             expected = {f["id"]: f for f in candidates}
             if current.keys() != expected.keys() or any(current[i].get("version") != expected[i].get("version") for i in current):
                 p.error("Source inventory changed; no cleanup performed")
+            trash_batch = []
+            def flush_trash():
+                if not trash_batch:
+                    return
+                failures = []
+                def callback(request_id, response, exception):
+                    if exception or not response or not response.get("trashed"):
+                        failures.append(request_id)
+                    else:
+                        totals["trashed"] += 1
+                        print(a.year, request_id, "trashed")
+                request = drive.new_batch_http_request(callback=callback)
+                for entry in trash_batch:
+                    request.add(drive.files().update(fileId=entry["id"], body={"trashed": True}, fields="id,trashed"), request_id=entry["id"])
+                request.execute()
+                trash_batch.clear()
+                if failures:
+                    p.error("Some trash operations not confirmed; inspect and resume")
             for f in candidates:
                 latest = drive.files().get(fileId=f["id"], fields="version,md5Checksum,trashed").execute()
                 if latest.get("trashed") or latest.get("version") != f["version"] or latest.get("md5Checksum") != f["md5Checksum"]:
                     p.error("Source changed; cleanup stopped")
-                result = drive.files().update(fileId=f["id"], body={"trashed": True}, fields="id,trashed").execute()
-                if not result.get("trashed"):
-                    p.error("Trash operation not confirmed")
-                totals["trashed"] += 1
-                print(a.year, f["name"], "trashed")
+                trash_batch.append(f)
+                if len(trash_batch) >= 25:
+                    flush_trash()
+            flush_trash()
             if list(walk(folders[0]["id"])):
                 p.error("Eligible source files remain; inspect before retrying")
             def prune_empty(parent):
@@ -398,7 +419,9 @@ def main():
                     break
             print(year, "existing album items:", len(existing), flush=True)
         batch = []
+        batch_started = None
         def flush_batch():
+            nonlocal batch_started
             if not batch:
                 return
             # Persist uncertain submissions before creating remote items.
@@ -421,6 +444,7 @@ def main():
                     print(year, filename, "batch failed")
             db.commit()
             batch.clear()
+            batch_started = None
         print(year, "scanning source media", flush=True)
         for f in walk(folder["id"]):
             id, name = f["id"], f["name"]
@@ -452,6 +476,8 @@ def main():
             if a.limit and count >= a.limit:
                 flush_batch()
                 return
+            if batch and (remaining_api_budget() <= 2 or time.monotonic() - batch_started >= 600):
+                flush_batch()
             count += 1
             print(year, name, "starting upload", flush=True)
             try:
@@ -502,6 +528,8 @@ def main():
                         r = photos_request("POST", BASE+"uploads", data=payload, headers={"Content-Type":"application/octet-stream","X-Goog-Upload-Protocol":"raw","X-Goog-Upload-Content-Type":f["mimeType"]}, timeout=300)
                     r.raise_for_status()
                     if not recovering:
+                        if not batch:
+                            batch_started = time.monotonic()
                         batch.append((id,name,r.text))
                         if len(batch) >= 50:
                             flush_batch()
