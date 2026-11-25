@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "google-picture-sync"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["google-api-python-client", "google-auth-oauthlib", "requests"]
+[project.scripts]
+google-picture-sync = "google_picture_sync:main"
+[tool.setuptools]
+py-modules = ["google_picture_sync"]
+[tool.setuptools.data-files]
+"share/man/man1" = ["man/google-picture-sync.1"]
