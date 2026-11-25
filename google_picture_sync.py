@@ -6,6 +6,8 @@ import os
 import re
 import sqlite3
 import tempfile
+import uuid
+from requests.exceptions import HTTPError
 from PIL import Image, ImageOps, ImageChops
 from pathlib import Path
 
@@ -278,11 +280,23 @@ def main():
         album = None
         for f in walk(folder["id"]):
             id, name = f["id"], f["name"]
-            row = db.execute("SELECT status FROM media WHERE id=?", (id,)).fetchone()
+            row = db.execute("SELECT status,remote FROM media WHERE id=?", (id,)).fetchone()
             if a.scan or a.dry_run:
                 print(year, name, row[0] if row else "new")
                 continue
-            if row and row[0] in ("done", "pending"):
+            recovering = False
+            if row and row[0] == "done":
+                if not row[1]:
+                    continue
+                try:
+                    api("GET", "mediaItems/" + row[1])
+                    continue
+                except HTTPError as e:
+                    if e.response is None or e.response.status_code != 404:
+                        raise
+                    recovering = True
+                    print(year, name, "recovering missing destination")
+            if row and row[0] == "pending":
                 continue
             if a.retry_failed and (not row or row[0] != "failed"):
                 continue
@@ -301,17 +315,37 @@ def main():
                     while not done:
                         _, done = downloader.next_chunk(num_retries=5)
                     tmp.seek(0)
-                    r = http.post(BASE+"uploads", data=tmp, headers={"Content-Type":"application/octet-stream","X-Goog-Upload-Protocol":"raw","X-Goog-Upload-Content-Type":f["mimeType"]}, timeout=300)
+                    original = tmp.read()
+                if f.get("md5Checksum") and hashlib.md5(original).hexdigest() != f["md5Checksum"]:
+                    raise ValueError("Source changed during download")
+                for attempt in range(3 if f["mimeType"] == "image/jpeg" else 1):
+                    payload = original
+                    if attempt:
+                        if not original.startswith(b"\xff\xd8"):
+                            raise ValueError("Invalid JPEG")
+                        comment = ("google-picture-sync recovery " + uuid.uuid4().hex).encode("ascii")
+                        payload = original[:2] + b"\xff\xfe" + (len(comment)+2).to_bytes(2,"big") + comment + original[2:]
+                    r = http.post(BASE+"uploads", data=payload, headers={"Content-Type":"application/octet-stream","X-Goog-Upload-Protocol":"raw","X-Goog-Upload-Content-Type":f["mimeType"]}, timeout=300)
                     r.raise_for_status()
-                    upload = r.text
-                db.execute("INSERT OR REPLACE INTO media VALUES (?,?,?,?,?,?)",(id,year,name,"pending",None,None))
-                db.commit()
-                result = api("POST","mediaItems:batchCreate",json={"albumId":album,"newMediaItems":[{"simpleMediaItem":{"uploadToken":upload,"fileName":name}}]})["newMediaItemResults"][0]
-                if result.get("status",{}).get("code",0):
-                    db.execute("UPDATE media SET status='failed',error=? WHERE id=?", (str(result["status"].get("code")),id))
-                else:
-                    db.execute("UPDATE media SET status='done',remote=? WHERE id=?", (result["mediaItem"]["id"],id))
-                db.commit()
+                    db.execute("INSERT OR REPLACE INTO media VALUES (?,?,?,?,?,?)",(id,year,name,"pending",None,None))
+                    db.commit()
+                    result = api("POST","mediaItems:batchCreate",json={"albumId":album,"newMediaItems":[{"simpleMediaItem":{"uploadToken":r.text,"fileName":name}}]})["newMediaItemResults"][0]
+                    if result.get("status",{}).get("code",0):
+                        db.execute("UPDATE media SET status='failed',error=? WHERE id=?", (str(result["status"].get("code")),id))
+                        db.commit()
+                        break
+                    remote = result["mediaItem"]["id"]
+                    db.execute("UPDATE media SET status='done',remote=?,error=NULL WHERE id=?", (remote,id))
+                    db.commit()
+                    try:
+                        api("GET", "mediaItems/" + remote)
+                        break
+                    except HTTPError as e:
+                        if e.response is None or e.response.status_code != 404:
+                            raise
+                        print(year, name, "destination 404 after upload; attempt", attempt+1)
+                        if attempt == 2 or f["mimeType"] != "image/jpeg":
+                            break
                 print(year,name,db.execute("SELECT status FROM media WHERE id=?",(id,)).fetchone()[0])
             except Exception as e:
                 db.execute("INSERT OR IGNORE INTO media VALUES (?,?,?,?,?,?)",(id,year,name,"failed",None,type(e).__name__))
