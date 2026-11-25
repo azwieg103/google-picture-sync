@@ -1,0 +1,46 @@
+.TH GOOGLE-PICTURE-SYNC 1 "November 2026" "0.1.0"
+.SH NAME
+google-picture-sync \- copy Google Drive media into yearly Google Photos albums
+.SH SYNOPSIS
+.B google-picture-sync
+.RI [ --config " file" ] " action"
+.RI [ --limit " count" ]
+.SH DESCRIPTION
+Recursively copy images and optionally videos from four-digit year folders.
+Originals are never deleted. Run from the repository directory.
+.SH OPTIONS
+.TP
+.B --init
+Create configuration.
+.TP
+.B --auth
+Authorize using desktop OAuth credentials.
+.TP
+.B --test
+Check Drive and Photos album read access.
+.TP
+.B --scan, --dry-run
+List eligible files without uploading.
+.TP
+.BI --year " YYYY"
+Migrate a single year.
+.TP
+.B --all, --resume
+Migrate all eligible uncompleted media.
+.TP
+.B --retry-failed
+Retry known failed records.
+.TP
+.B --status
+Display local migration counts.
+.TP
+.B --limit
+Maximum new upload attempts; zero means unlimited.
+.TP
+.B --help, --version
+Display usage or version.
+.SH FILES
+.env/config.ini, .env/credentials.json, .env/token.json, .env/migration.sqlite3
+.SH NOTES
+Pending records are skipped to avoid duplicate uploads after uncertain API outcomes.
+Do not run concurrent instances. Google passwords are not used.
