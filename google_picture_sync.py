@@ -73,9 +73,13 @@ def main():
     db = sqlite3.connect(path.parent / "migration.sqlite3")
     db.execute("CREATE TABLE IF NOT EXISTS media (id TEXT PRIMARY KEY, year TEXT, name TEXT, status TEXT, remote TEXT, error TEXT)")
     db.execute("CREATE TABLE IF NOT EXISTS albums (year TEXT PRIMARY KEY, id TEXT)")
+    db.execute("CREATE TABLE IF NOT EXISTS cleanup_history (source_id TEXT PRIMARY KEY, year TEXT, remote TEXT, trashed_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+    db.commit()
     if a.status:
         for row in db.execute("SELECT year,status,count(*) FROM media GROUP BY year,status ORDER BY year"):
             print(*row)
+        for row in db.execute("SELECT year, count(*) FROM cleanup_history GROUP BY year ORDER BY year"):
+            print(row[0], "trash_confirmed", row[1])
         return
     token = Path(c["google"]["token_file"])
     if a.auth or a.cleanup:
@@ -346,11 +350,11 @@ def main():
             if key not in records:
                 totals["unverified"] += 1
                 print(key[0], f["name"], "unverified: no migration record")
-        if a.cleanup and not totals["unverified"] and totals["verified"]:
+        if a.cleanup and candidates:
             # Recheck complete inventory before making any changes.
             current = {f["id"]: f for f in walk(folders[0]["id"])}
             expected = {f["id"]: f for f in candidates}
-            if current.keys() != expected.keys() or any(current[i].get("version") != expected[i].get("version") for i in current):
+            if any(i not in current or current[i].get("version") != expected[i].get("version") for i in expected):
                 p.error("Source inventory changed; no cleanup performed")
             for f in candidates:
                 latest = drive.files().get(fileId=f["id"], fields="version,md5Checksum,trashed").execute()
@@ -359,10 +363,12 @@ def main():
                 result = drive.files().update(fileId=f["id"], body={"trashed": True}, fields="id,trashed").execute()
                 if not result.get("trashed"):
                     p.error("Trash operation not confirmed")
+                db.execute("INSERT OR REPLACE INTO cleanup_history(source_id,year,remote) VALUES (?,?,?)", (f["id"],str(a.year),records[(str(a.year),f["id"])][1]))
+                db.commit()
                 totals["trashed"] += 1
                 print(a.year, f["name"], "trashed")
-            if list(walk(folders[0]["id"])):
-                p.error("Eligible source files remain; inspect before retrying")
+            remaining = list(walk(folders[0]["id"]))
+            print("Source media remaining:", len(remaining))
             def prune_empty(parent):
                 for child in list(children(parent)):
                     if child["mimeType"] != FOLDER:
@@ -381,8 +387,9 @@ def main():
                     totals["folders_trashed"] += 1
                     print(a.year, child["name"], "empty folder trashed")
             prune_empty(folders[0]["id"])
-            db.execute("INSERT OR IGNORE INTO completed_year VALUES (?)", (str(a.year),))
-            db.commit()
+            if not remaining and not totals["unverified"]:
+                db.execute("INSERT OR IGNORE INTO completed_year VALUES (?)", (str(a.year),))
+                db.commit()
         print("Verification summary:", totals)
         db.close()
         return 1 if totals["unverified"] or not totals["verified"] else 0
@@ -445,7 +452,7 @@ def main():
             if a.scan or a.dry_run:
                 print(year, name, row[0] if row else "new")
                 continue
-            recovering = False
+            recovering = bool(row and row[0] == "failed")
             if row and row[0] == "done":
                 if not row[1]:
                     continue
@@ -533,6 +540,8 @@ def main():
                     if result.get("status",{}).get("code",0):
                         db.execute("UPDATE media SET status='failed',error=? WHERE id=?", (str(result["status"].get("code")),id))
                         db.commit()
+                        if result["status"].get("code") == 6 and f["mimeType"] in ("image/jpeg","video/mp4") and attempt < 2:
+                            continue
                         break
                     remote = result["mediaItem"]["id"]
                     db.execute("UPDATE media SET status='done',remote=?,error=NULL WHERE id=?", (remote,id))
