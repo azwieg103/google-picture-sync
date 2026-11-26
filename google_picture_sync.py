@@ -133,30 +133,16 @@ def main():
     quota_zone = ZoneInfo("America/Los_Angeles")
     db.execute("CREATE TABLE IF NOT EXISTS quota_usage (day TEXT, kind TEXT, count INTEGER NOT NULL, PRIMARY KEY(day,kind))")
     db.commit()
+    # Local counters are diagnostic only; Google enforces actual project quotas.
+    db.execute("CREATE TABLE IF NOT EXISTS quota_responses (day TEXT, kind TEXT, status INTEGER, count INTEGER NOT NULL, PRIMARY KEY(day,kind,status))")
+    db.commit()
     def remaining_api_budget():
-        day = datetime.now(quota_zone).date().isoformat()
-        row = db.execute("SELECT count FROM quota_usage WHERE day=? AND kind=?", (day,"api")).fetchone()
-        return c.getint("photos","daily_api_budget",fallback=9000) - (row[0] if row else 0)
-    def reserve_quota(url):
+        return 10000
+    def record_quota_response(url, status):
         kind = "api" if urlsplit(url).hostname == "photoslibrary.googleapis.com" else "media"
-        limit = c.getint("photos", "daily_api_budget" if kind == "api" else "daily_media_budget", fallback=9000 if kind == "api" else 67500)
-        if limit <= 0:
-            raise ValueError("Daily quota budget must be positive")
-        while True:
-            now = datetime.now(quota_zone)
-            day = now.date().isoformat()
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT count FROM quota_usage WHERE day=? AND kind=?", (day,kind)).fetchone()
-            used = row[0] if row else 0
-            if used < limit:
-                db.execute("INSERT INTO quota_usage VALUES (?,?,1) ON CONFLICT(day,kind) DO UPDATE SET count=count+1", (day,kind))
-                db.commit()
-                return
-            db.rollback()
-            reset = datetime.combine(now.date()+timedelta(days=1), datetime.min.time(), tzinfo=quota_zone)+timedelta(minutes=5)
-            wait = max(1, reset.timestamp()-now.timestamp())
-            print(f"Daily Photos {kind} budget reached ({used}/{limit}); waiting until {reset.isoformat()}", flush=True)
-            time.sleep(wait)
+        day = datetime.now(quota_zone).date().isoformat()
+        db.execute("INSERT INTO quota_responses VALUES (?,?,?,1) ON CONFLICT(day,kind,status) DO UPDATE SET count=count+1", (day,kind,status))
+        db.commit()
     last_request = 0.0
     def photos_request(method, url, **kw):
         nonlocal last_request
@@ -164,8 +150,8 @@ def main():
         while True:
             time.sleep(max(0, 2.0 - (time.monotonic() - last_request)))
             last_request = time.monotonic()
-            reserve_quota(url)
             r = http.request(method, url, **kw)
+            record_quota_response(url, r.status_code)
             if r.status_code != 429:
                 return r
             from email.utils import parsedate_to_datetime
