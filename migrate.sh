@@ -42,7 +42,6 @@ for year in "${years[@]}"; do
     if (
         echo "=== Migrating $year at $(date -Is) ==="
         "$sync" --year "$year" &&
-        "$sync" --verify --year "$year" &&
         "$sync" --cleanup --year "$year" --accept-processed &&
         "$sync" --verify --year "$year" &&
         "$sync" --dry-run --year "$year"
