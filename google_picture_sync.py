@@ -47,16 +47,26 @@ def main():
     g = p.add_mutually_exclusive_group()
     for flag in ("init", "auth", "test", "scan", "dry-run", "all", "resume", "status", "retry-failed", "verify", "cleanup"):
         g.add_argument("--" + flag, action="store_true")
+    g.add_argument("--create-albums", metavar="YEAR[-YEAR]", help="Create or reuse yearly Photos albums without migrating media")
     p.add_argument("--year", type=int, help="Restrict to a year; alone, upload that year")
     p.add_argument("--limit", type=int, default=0, help="Maximum new uploads this run (0 unlimited)")
     p.add_argument("--accept-processed", action="store_true", help="Allow processed images with matching dimensions and recorded upload ID even if pixels differ")
     a = p.parse_args()
-    if not any((a.init, a.auth, a.test, a.scan, a.dry_run, a.all, a.resume, a.status, a.retry_failed, a.verify, a.cleanup, a.year)):
+    if not any((a.init, a.auth, a.test, a.scan, a.dry_run, a.all, a.resume, a.status, a.retry_failed, a.verify, a.cleanup, a.create_albums, a.year)):
         p.error("Specify an action or --year")
     if a.year is not None and not 1000 <= a.year <= 9999:
         p.error("--year must be a four-digit year")
     if a.year and any((a.init, a.auth, a.test, a.status)):
         p.error("--year cannot be combined with --init, --auth, --test or --status")
+    album_years = []
+    if a.create_albums:
+        match = re.fullmatch(r"(\d{4})(?:-(\d{4}))?", a.create_albums)
+        if not match or a.year or a.limit or a.accept_processed:
+            p.error("--create-albums requires YEAR or YEAR-YEAR, without migration options")
+        first, last = int(match[1]), int(match[2] or match[1])
+        if not 1000 <= first <= last <= 9999 or last-first > 100:
+            p.error("Specify an ascending range of at most 101 four-digit years")
+        album_years = [str(y) for y in range(first,last+1)]
     if a.cleanup and not a.year:
         p.error("--cleanup requires --year")
     if a.limit < 0:
@@ -172,6 +182,43 @@ def main():
         r = photos_request(method, BASE + endpoint, timeout=120, **kw)
         r.raise_for_status()
         return r.json()
+    if album_years:
+        # Only albums visible to this OAuth application can be discovered.
+        by_title = {}
+        page = None
+        while True:
+            params = {"pageSize": 50}
+            if page:
+                params["pageToken"] = page
+            result = api("GET", "albums", params=params)
+            for item in result.get("albums", []):
+                by_title.setdefault(item["title"], []).append(item["id"])
+            page = result.get("nextPageToken")
+            if not page:
+                break
+        for year in album_years:
+            title = c["photos"].get("album_prefix", "") + year
+            saved = db.execute("SELECT id FROM albums WHERE year=?", (year,)).fetchone()
+            matches = by_title.get(title, [])
+            if saved:
+                item = api("GET", "albums/" + saved[0])
+                if item.get("title") != title:
+                    p.error(f"{year}: saved album title differs; inspect before proceeding")
+                album_id = saved[0]
+                action = "existing saved album"
+            elif len(matches) > 1:
+                p.error(f"{year}: multiple matching albums; refusing ambiguous selection")
+            elif matches:
+                album_id = matches[0]
+                action = "existing album adopted"
+            else:
+                album_id = api("POST", "albums", json={"album":{"title":title}})["id"]
+                action = "album created"
+            db.execute("INSERT OR REPLACE INTO albums VALUES (?,?)", (year,album_id))
+            db.commit()
+            print(year, action, flush=True)
+        db.close()
+        return 0
     def listing(q):
         page = None
         while True:
