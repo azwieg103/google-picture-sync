@@ -34,7 +34,7 @@ def video_stream_hash(path):
     if not streams or any(x["codec_type"] not in ("video", "audio") for x in streams):
         raise ValueError("Unsupported video stream layout")
     signature = [{k:x.get(k) for k in ("codec_type","codec_name","width","height","sample_rate","channels","time_base","duration_ts","start_pts")} for x in streams]
-    hashes = subprocess.run(["ffmpeg","-v","error","-xerror","-i",path,"-map","0","-c","copy","-f","streamhash","-hash","sha256","-"], check=True, capture_output=True, text=True, timeout=600)
+    hashes = subprocess.run(["ffmpeg","-nostdin","-v","error","-xerror","-i",path,"-map","0","-c","copy","-f","streamhash","-hash","sha256","-"], check=True, capture_output=True, text=True, timeout=600)
     if len(hashes.stdout.strip().splitlines()) != len(streams):
         raise ValueError("Incomplete stream hashes")
     return signature, hashes.stdout.strip()
@@ -46,12 +46,56 @@ def decoded_video_hash(path):
     if not streams or any(x["codec_type"] not in ("video","audio") for x in streams):
         raise ValueError("Unsupported decoded stream layout")
     signature = [{k:x.get(k) for k in ("codec_type","width","height","sample_rate","channels","channel_layout")} for x in streams]
-    result = subprocess.run(["ffmpeg","-v","error","-xerror","-i",path,"-map","0","-c:v","rawvideo","-pix_fmt","yuv444p16le","-c:a","pcm_s32le","-f","framehash","-hash","sha256","-"], check=True, capture_output=True, text=True, timeout=1800)
+    result = subprocess.run(["ffmpeg","-nostdin","-v","error","-xerror","-i",path,"-map","0","-c:v","rawvideo","-pix_fmt","yuv444p16le","-c:a","pcm_s32le","-f","framehash","-hash","sha256","-"], check=True, capture_output=True, text=True, timeout=1800)
     # Preserve frame timestamps, durations, stream order and hashes.
     lines = [line.strip() for line in result.stdout.splitlines() if not line.startswith("#software")]
     if not any(line and not line.startswith("#") for line in lines):
         raise ValueError("No decoded frames")
     return signature, lines
+
+def processed_video_match(left, right):
+    # Conservative comparison of all frames and audio, not just metadata.
+    def probe(path):
+        return json.loads(subprocess.run(["ffprobe","-v","error","-show_streams","-show_format","-of","json",path], check=True, capture_output=True, text=True, timeout=300).stdout)
+    from fractions import Fraction
+    import math
+    a, b = probe(left), probe(right)
+    x, y = a["streams"], b["streams"]
+    print("Video codecs:", [t.get("codec_name") for t in x], "->", [t.get("codec_name") for t in y])
+    if len(x) != len(y) or sum(t["codec_type"] == "video" for t in x) != 1 or sum(t["codec_type"] == "audio" for t in x) > 1:
+        raise ValueError("Unsupported processed stream layout")
+    if abs(float(a["format"]["duration"])-float(b["format"]["duration"])) > 0.10:
+        raise ValueError("Processed video duration differs")
+    for u,v in zip(x,y):
+        if u["codec_type"] != v["codec_type"]:
+            raise ValueError("Stream types differ")
+        if u["codec_type"] == "video":
+            if any(u.get(k) != v.get(k) for k in ("width","height","sample_aspect_ratio")):
+                raise ValueError("Video geometry differs")
+            if abs(float(Fraction(u["avg_frame_rate"]))-float(Fraction(v["avg_frame_rate"]))) > 0.01:
+                raise ValueError("Frame rate differs")
+        elif u["codec_type"] == "audio":
+            if any(u.get(k) != v.get(k) for k in ("channels","channel_layout","sample_rate")):
+                raise ValueError("Audio layout differs")
+        else:
+            raise ValueError("Unsupported stream type")
+    with tempfile.TemporaryDirectory() as work:
+        # Decode every frame; compare corresponding frames with SSIM.
+        stats = os.path.join(work,"ssim.log")
+        subprocess.run(["ffmpeg","-nostdin","-v","error","-xerror","-i",left,"-i",right,"-filter_complex",f"[0:v]settb=AVTB,setpts=PTS-STARTPTS[a];[1:v]settb=AVTB,setpts=PTS-STARTPTS[b];[a][b]ssim=stats_file={stats}:shortest=1:repeatlast=0","-an","-f","null","-"],check=True,capture_output=True,timeout=3600)
+        scores = [float(m) for m in re.findall(r"All:([0-9.]+)",Path(stats).read_text())]
+        def frames(path):
+            result = subprocess.run(["ffprobe","-v","error","-count_frames","-select_streams","v:0","-show_entries","stream=nb_read_frames","-of","csv=p=0",path],check=True,capture_output=True,text=True,timeout=3600)
+            return int(result.stdout.strip())
+        if not scores or len(scores) != frames(left) or len(scores) != frames(right) or min(scores) < 0.95 or sum(scores)/len(scores) < 0.98:
+            raise ValueError("Processed video frame similarity insufficient")
+        if any(t["codec_type"] == "audio" for t in x):
+            # Require exact decoded audio for now; reject lossy audio changes.
+            def audio_hash(path):
+                return subprocess.run(["ffmpeg","-nostdin","-v","error","-xerror","-i",path,"-map","0:a:0","-c:a","pcm_s32le","-f","hash","-hash","sha256","-"],check=True,capture_output=True,timeout=3600).stdout
+            if audio_hash(left) != audio_hash(right):
+                raise ValueError("Processed audio differs; retained")
+        print("Processed video SSIM:", min(scores), sum(scores)/len(scores), "frames:", len(scores))
 
 def main():
     os.umask(0o077)
@@ -65,7 +109,10 @@ def main():
     p.add_argument("--year", type=int, help="Restrict to a year; alone, upload that year")
     p.add_argument("--limit", type=int, default=0, help="Maximum new uploads this run (0 unlimited)")
     p.add_argument("--accept-processed", action="store_true", help="Allow processed images with matching dimensions and recorded upload ID even if pixels differ")
+    p.add_argument("--accept-processed-video", action="store_true", help="Opt in to conservative processed video verification; original quality may differ")
     a = p.parse_args()
+    if a.accept_processed_video and not a.cleanup:
+        p.error("--accept-processed-video requires --cleanup")
     if not any((a.init, a.auth, a.test, a.scan, a.dry_run, a.all, a.resume, a.status, a.retry_failed, a.verify, a.cleanup, a.create_albums, a.year)):
         p.error("Specify an action or --year")
     if a.year is not None and not 1000 <= a.year <= 9999:
@@ -314,7 +361,7 @@ def main():
     db.execute("CREATE TABLE IF NOT EXISTS completed_year (year TEXT PRIMARY KEY)")
     db.commit()
     if a.verify or a.cleanup:
-        totals = {"verified": 0, "unverified": 0, "trashed": 0, "exact": 0, "pixel_match": 0, "processed": 0, "folders_trashed": 0, "video_stream_match": 0}
+        totals = {"verified": 0, "unverified": 0, "trashed": 0, "exact": 0, "pixel_match": 0, "processed": 0, "folders_trashed": 0, "video_stream_match": 0, "processed_video": 0}
         query = "SELECT year,id,name,status,remote FROM media"
         args = ()
         if a.year:
@@ -361,7 +408,7 @@ def main():
                 if a.cleanup and f:
                     if not f.get("md5Checksum") or not f.get("version") or not f.get("capabilities", {}).get("canTrash"):
                         raise ValueError("Source checksum, version or trash permission missing")
-                    cached = db.execute("SELECT kind FROM verified_source WHERE source_id=? AND version=? AND remote=? AND policy=?", (source_id, f["version"], remote, int(a.accept_processed))).fetchone()
+                    cached = db.execute("SELECT kind FROM verified_source WHERE source_id=? AND version=? AND remote=? AND policy=?", (source_id, f["version"], remote, (int(a.accept_processed) | (2 if a.accept_processed_video else 0)))).fetchone()
                     if cached:
                         totals[cached[0]] += 1
                         candidates.append(f)
@@ -372,20 +419,28 @@ def main():
                         item = api("GET", "mediaItems/" + remote)
                     if f["mimeType"].startswith("video/") and item.get("mediaMetadata", {}).get("video", {}).get("status") != "READY":
                         raise ValueError("Video not ready; retained for next run")
-                    before = {k: totals[k] for k in ("exact", "pixel_match", "processed", "video_stream_match")}
+                    before = {k: totals[k] for k in ("exact", "pixel_match", "processed", "video_stream_match", "processed_video")}
                     digest = hashlib.md5()
                     suffix = "=dv" if f["mimeType"].startswith("video/") else "=d"
                     with tempfile.TemporaryFile() as dest:
-                        response = photos_request("GET", item["baseUrl"] + suffix, stream=True, timeout=300)
-                        if response.status_code in (400,403,404):
-                            response.close()
-                            item = api("GET", "mediaItems/" + remote)
-                            response = photos_request("GET", item["baseUrl"] + suffix, stream=True, timeout=300)
-                        with response:
-                            response.raise_for_status()
-                            for chunk in response.iter_content(1024 * 1024):
-                                digest.update(chunk)
-                                dest.write(chunk)
+                        for attempt in range(4):
+                            try:
+                                if attempt:
+                                    time.sleep(2**attempt)
+                                    item = api("GET", "mediaItems/" + remote)
+                                dest.seek(0)
+                                dest.truncate()
+                                digest = hashlib.md5()
+                                with photos_request("GET", item["baseUrl"] + suffix, stream=True, timeout=300) as response:
+                                    response.raise_for_status()
+                                    for chunk in response.iter_content(1024 * 1024):
+                                        digest.update(chunk)
+                                        dest.write(chunk)
+                                break
+                            except (HTTPError, ConnectionError, Timeout) as exc:
+                                if attempt == 3 or (isinstance(exc, HTTPError) and exc.response is not None and exc.response.status_code not in (400,403,404,408,500,502,503,504)):
+                                    raise
+                                print(year, name, "download retry", attempt+1, flush=True)
                         if digest.hexdigest() == f["md5Checksum"]:
                             totals["exact"] += 1
                         elif f["mimeType"].startswith("image/"):
@@ -432,16 +487,22 @@ def main():
                                 dest.seek(0)
                                 with open(dest_path, "wb") as out:
                                     shutil.copyfileobj(dest, out)
-                                if video_stream_hash(source_path) != video_stream_hash(dest_path):
-                                    if decoded_video_hash(source_path) != decoded_video_hash(dest_path):
-                                        raise ValueError("Decoded video/audio or timing differs; retained")
+                                if video_stream_hash(source_path) == video_stream_hash(dest_path):
+                                    totals["video_stream_match"] += 1
+                                    print(year, name, "fallback: matching encoded video/audio streams")
+                                elif decoded_video_hash(source_path) == decoded_video_hash(dest_path):
+                                    totals["video_stream_match"] += 1
                                     print(year, name, "fallback: exact decoded frames and audio")
-                                totals["video_stream_match"] += 1
-                                print(year, name, "fallback: matching encoded video/audio streams")
+                                elif a.accept_processed_video:
+                                    processed_video_match(source_path, dest_path)
+                                    totals["processed_video"] += 1
+                                    print(year, name, "fallback: processed video accepted")
+                                else:
+                                    raise ValueError("Decoded video/audio or timing differs; retained")
                         else:
                             raise ValueError("Video bytes differ; retained")
                     kind = next(k for k in before if totals[k] > before[k])
-                    db.execute("INSERT OR REPLACE INTO verified_source VALUES (?,?,?,?,?)", (source_id, f["version"], remote, int(a.accept_processed), kind))
+                    db.execute("INSERT OR REPLACE INTO verified_source VALUES (?,?,?,?,?)", (source_id, f["version"], remote, (int(a.accept_processed) | (2 if a.accept_processed_video else 0)), kind))
                     db.commit()
                     candidates.append(f)
                 totals["verified"] += 1
