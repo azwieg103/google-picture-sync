@@ -761,15 +761,8 @@ def main():
                     remote = result["mediaItem"]["id"]
                     db.execute("UPDATE media SET status='done',remote=?,error=NULL WHERE id=?", (remote,id))
                     db.commit()
-                    try:
-                        api("GET", "mediaItems/" + remote)
-                        break
-                    except HTTPError as e:
-                        if e.response is None or e.response.status_code != 404:
-                            raise
-                        print(year, name, "destination 404 after upload; attempt", attempt+1)
-                        if attempt == 2 or f["mimeType"] not in ("image/jpeg", "video/mp4"):
-                            break
+                    print(year, name, "upload accepted; awaiting album visibility")
+                    break
                 if recovering:
                     print(year,name,db.execute("SELECT status FROM media WHERE id=?",(id,)).fetchone()[0])
             except Exception as e:
