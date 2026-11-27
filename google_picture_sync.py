@@ -134,7 +134,10 @@ def main():
     p.add_argument("--videos-only", action="store_true", help="Restrict migration and verification to videos")
     p.add_argument("--accept-unverified-video", action="store_true", help="Accept playable uploaded videos with matching duration, resolution and stream counts; content identity is not guaranteed")
     p.add_argument("--folder", help="Migrate a named direct child of the Pictures folder")
+    p.add_argument("--trust-uploaded-video", action="store_true", help="Trash source videos based on recorded upload and album membership only; no content verification")
     a = p.parse_args()
+    if a.trust_uploaded_video and not (a.cleanup and a.videos_only):
+        p.error("--trust-uploaded-video requires --cleanup and --videos-only")
     if a.folder:
         if a.year or a.create_albums or any((a.init,a.auth,a.test,a.status)):
             p.error("--folder cannot be combined with --year, --create-albums, --init, --auth, --test or --status")
@@ -401,7 +404,7 @@ def main():
     db.execute("CREATE TABLE IF NOT EXISTS completed_year (year TEXT PRIMARY KEY)")
     db.commit()
     if a.verify or a.cleanup:
-        totals = {"verified": 0, "unverified": 0, "trashed": 0, "exact": 0, "pixel_match": 0, "processed": 0, "folders_trashed": 0, "video_stream_match": 0, "processed_video": 0, "migration_video": 0}
+        totals = {"verified": 0, "unverified": 0, "trashed": 0, "exact": 0, "pixel_match": 0, "processed": 0, "folders_trashed": 0, "video_stream_match": 0, "processed_video": 0, "migration_video": 0, "trusted_video": 0}
         query = "SELECT year,id,name,status,remote FROM media"
         args = ()
         if selection:
@@ -453,6 +456,11 @@ def main():
                 if a.cleanup and f:
                     if not f.get("md5Checksum") or not f.get("version") or not f.get("capabilities", {}).get("canTrash"):
                         raise ValueError("Source checksum, version or trash permission missing")
+                    if a.trust_uploaded_video and f["mimeType"].startswith("video/"):
+                        totals["trusted_video"] += 1
+                        candidates.append(f)
+                        print(year, name, "trusted upload: album membership confirmed; content NOT verified")
+                        continue
                     cached = db.execute("SELECT kind FROM verified_source WHERE source_id=? AND version=? AND remote=? AND policy=?", (source_id, f["version"], remote, (int(a.accept_processed) | (2 if a.accept_processed_video else 0) | (4 if a.accept_unverified_video else 0)))).fetchone()
                     if cached:
                         totals[cached[0]] += 1
