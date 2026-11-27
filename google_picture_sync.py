@@ -97,6 +97,27 @@ def processed_video_match(left, right):
                 raise ValueError("Processed audio differs; retained")
         print("Processed video SSIM:", min(scores), sum(scores)/len(scores), "frames:", len(scores))
 
+def migration_video_check(left, right):
+    def probe(path):
+        return json.loads(subprocess.run(["ffprobe","-v","error","-show_streams","-show_format","-of","json",path],check=True,capture_output=True,text=True,timeout=300).stdout)
+    a,b = probe(left),probe(right)
+    import math
+    for obj in (a,b):
+        duration = float(obj["format"]["duration"])
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError("Invalid video duration")
+    if abs(float(a["format"]["duration"])-float(b["format"]["duration"])) > 0.5:
+        raise ValueError("Migration video duration differs")
+    for kind in ("video","audio"):
+        x = [t for t in a["streams"] if t["codec_type"] == kind]
+        y = [t for t in b["streams"] if t["codec_type"] == kind]
+        if len(x) != len(y) or (kind == "video" and not x):
+            raise ValueError("Migration stream count differs")
+        for u,v in zip(x,y):
+            if kind == "video" and any(u.get(k) != v.get(k) for k in ("width","height")):
+                raise ValueError("Migration video resolution differs")
+    subprocess.run(["ffmpeg","-nostdin","-v","error","-xerror","-i",right,"-map","0:v","-map","0:a?","-f","null","-"],check=True,capture_output=True,timeout=3600)
+
 def main():
     os.umask(0o077)
     p = argparse.ArgumentParser(description="Copy Drive photos to Google Photos without deleting originals")
@@ -111,7 +132,10 @@ def main():
     p.add_argument("--accept-processed", action="store_true", help="Allow processed images with matching dimensions and recorded upload ID even if pixels differ")
     p.add_argument("--accept-processed-video", action="store_true", help="Opt in to conservative processed video verification; original quality may differ")
     p.add_argument("--videos-only", action="store_true", help="Restrict migration and verification to videos")
+    p.add_argument("--accept-unverified-video", action="store_true", help="Accept playable uploaded videos with matching duration, resolution and stream counts; content identity is not guaranteed")
     a = p.parse_args()
+    if a.accept_unverified_video and not a.cleanup:
+        p.error("--accept-unverified-video requires --cleanup")
     if a.accept_processed_video and not a.cleanup:
         p.error("--accept-processed-video requires --cleanup")
     if not any((a.init, a.auth, a.test, a.scan, a.dry_run, a.all, a.resume, a.status, a.retry_failed, a.verify, a.cleanup, a.create_albums, a.year)):
@@ -366,7 +390,7 @@ def main():
     db.execute("CREATE TABLE IF NOT EXISTS completed_year (year TEXT PRIMARY KEY)")
     db.commit()
     if a.verify or a.cleanup:
-        totals = {"verified": 0, "unverified": 0, "trashed": 0, "exact": 0, "pixel_match": 0, "processed": 0, "folders_trashed": 0, "video_stream_match": 0, "processed_video": 0}
+        totals = {"verified": 0, "unverified": 0, "trashed": 0, "exact": 0, "pixel_match": 0, "processed": 0, "folders_trashed": 0, "video_stream_match": 0, "processed_video": 0, "migration_video": 0}
         query = "SELECT year,id,name,status,remote FROM media"
         args = ()
         if a.year:
@@ -418,7 +442,7 @@ def main():
                 if a.cleanup and f:
                     if not f.get("md5Checksum") or not f.get("version") or not f.get("capabilities", {}).get("canTrash"):
                         raise ValueError("Source checksum, version or trash permission missing")
-                    cached = db.execute("SELECT kind FROM verified_source WHERE source_id=? AND version=? AND remote=? AND policy=?", (source_id, f["version"], remote, (int(a.accept_processed) | (2 if a.accept_processed_video else 0)))).fetchone()
+                    cached = db.execute("SELECT kind FROM verified_source WHERE source_id=? AND version=? AND remote=? AND policy=?", (source_id, f["version"], remote, (int(a.accept_processed) | (2 if a.accept_processed_video else 0) | (4 if a.accept_unverified_video else 0)))).fetchone()
                     if cached:
                         totals[cached[0]] += 1
                         candidates.append(f)
@@ -429,7 +453,7 @@ def main():
                         item = api("GET", "mediaItems/" + remote)
                     if f["mimeType"].startswith("video/") and item.get("mediaMetadata", {}).get("video", {}).get("status") != "READY":
                         raise ValueError("Video not ready; retained for next run")
-                    before = {k: totals[k] for k in ("exact", "pixel_match", "processed", "video_stream_match", "processed_video")}
+                    before = {k: totals[k] for k in ("exact", "pixel_match", "processed", "video_stream_match", "processed_video", "migration_video")}
                     digest = hashlib.md5()
                     suffix = "=dv" if f["mimeType"].startswith("video/") else "=d"
                     with tempfile.TemporaryFile() as dest:
@@ -497,7 +521,11 @@ def main():
                                 dest.seek(0)
                                 with open(dest_path, "wb") as out:
                                     shutil.copyfileobj(dest, out)
-                                if video_stream_hash(source_path) == video_stream_hash(dest_path):
+                                if a.accept_unverified_video:
+                                    migration_video_check(source_path, dest_path)
+                                    totals["migration_video"] += 1
+                                    print(year, name, "migration policy: playable copy accepted; content identity not established")
+                                elif video_stream_hash(source_path) == video_stream_hash(dest_path):
                                     totals["video_stream_match"] += 1
                                     print(year, name, "fallback: matching encoded video/audio streams")
                                 elif decoded_video_hash(source_path) == decoded_video_hash(dest_path):
@@ -512,7 +540,7 @@ def main():
                         else:
                             raise ValueError("Video bytes differ; retained")
                     kind = next(k for k in before if totals[k] > before[k])
-                    db.execute("INSERT OR REPLACE INTO verified_source VALUES (?,?,?,?,?)", (source_id, f["version"], remote, (int(a.accept_processed) | (2 if a.accept_processed_video else 0)), kind))
+                    db.execute("INSERT OR REPLACE INTO verified_source VALUES (?,?,?,?,?)", (source_id, f["version"], remote, (int(a.accept_processed) | (2 if a.accept_processed_video else 0) | (4 if a.accept_unverified_video else 0)), kind))
                     db.commit()
                     candidates.append(f)
                 totals["verified"] += 1
