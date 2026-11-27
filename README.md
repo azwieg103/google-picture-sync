@@ -166,3 +166,22 @@ The migration defaults to 9,000 API requests and 67,500 media requests per Pacif
 ## Efficient unattended migration
 
 New uploads are created in batches of up to 50, with early flush near the local API budget or after ten minutes of token collection. Existing album membership is fetched in pages of 100. Missing items use individual recovery checks. Integrity checkpoints are keyed by source version, destination ID and processed-image policy; album membership is rechecked before cleanup. Videos not READY are retained for another run. Successfully cleaned years with empty source inventories are skipped on subsequent runs; newly added media is still scanned. Drive trash remains individual to minimize the interval between source version check and trash. Ambiguous batch submissions remain pending for manual reconciliation and block cleanup. External quota usage or a prolonged 429 can still cause upload tokens to expire. Run `bash migrate.sh 2021-2005` from cron; inspect `.env/logs/` for failures. These changes require live validation before relying on unattended deletion.
+
+
+## Annual migration
+
+After the current migration exits, install the latest version and create albums in advance:
+
+```bash
+.venv/bin/google-picture-sync --create-albums 2022-2026
+```
+
+A single year is also supported. Existing app-visible albums are reused and recorded in SQLite; ambiguous titles are rejected. Google Photos only exposes albums created by this application under its current API scopes. Albums created manually may not be discoverable. This command does not upload or trash media. Do not run concurrently with a migration.
+
+For an annual migration, place photos and videos in the corresponding year folder beneath the configured Drive Pictures folder, then run:
+
+```bash
+bash migrate.sh 2026
+```
+
+The wrapper uploads, verifies and moves eligible originals to Drive Trash. Keep Trash until results are reviewed. For upload only, use `--year 2026` directly.
