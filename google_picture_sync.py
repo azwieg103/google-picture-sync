@@ -10,7 +10,7 @@ import uuid
 import subprocess
 import shutil
 import time
-from requests.exceptions import HTTPError
+from requests.exceptions import HTTPError, ConnectionError, Timeout
 from PIL import Image, ImageOps, ImageChops
 from pathlib import Path
 
@@ -38,6 +38,20 @@ def video_stream_hash(path):
     if len(hashes.stdout.strip().splitlines()) != len(streams):
         raise ValueError("Incomplete stream hashes")
     return signature, hashes.stdout.strip()
+
+def decoded_video_hash(path):
+    # Exact decoded content only: lossy transcoding is not proof of identity.
+    probe = subprocess.run(["ffprobe","-v","error","-show_streams","-of","json",path], check=True, capture_output=True, text=True, timeout=300)
+    streams = json.loads(probe.stdout)["streams"]
+    if not streams or any(x["codec_type"] not in ("video","audio") for x in streams):
+        raise ValueError("Unsupported decoded stream layout")
+    signature = [{k:x.get(k) for k in ("codec_type","width","height","sample_rate","channels","channel_layout")} for x in streams]
+    result = subprocess.run(["ffmpeg","-v","error","-xerror","-i",path,"-map","0","-c:v","rawvideo","-pix_fmt","yuv444p16le","-c:a","pcm_s32le","-f","framehash","-hash","sha256","-"], check=True, capture_output=True, text=True, timeout=1800)
+    # Preserve frame timestamps, durations, stream order and hashes.
+    lines = [line.strip() for line in result.stdout.splitlines() if not line.startswith("#software")]
+    if not any(line and not line.startswith("#") for line in lines):
+        raise ValueError("No decoded frames")
+    return signature, lines
 
 def main():
     os.umask(0o077)
@@ -219,6 +233,47 @@ def main():
             print(year, action, flush=True)
         db.close()
         return 0
+    def upload_payload(payload, mime):
+        headers = {"Content-Type":"application/octet-stream","X-Goog-Upload-Protocol":"raw","X-Goog-Upload-Content-Type":mime}
+        if mime.startswith("video/"):
+            # Restart an interrupted upload session, never an uncertain media creation.
+            for attempt in range(3):
+                try:
+                    with photos_request("POST", BASE+"uploads", headers={"X-Goog-Upload-Protocol":"resumable","X-Goog-Upload-Command":"start","X-Goog-Upload-Raw-Size":str(len(payload)),"X-Goog-Upload-Content-Type":mime}, timeout=120) as start:
+                        start.raise_for_status()
+                        url = start.headers["X-Goog-Upload-URL"]
+                        granularity = int(start.headers.get("X-Goog-Upload-Chunk-Granularity", "262144"))
+                    if granularity <= 0:
+                        raise ValueError("Invalid upload chunk granularity")
+                    chunk_size = max(granularity, (8*1024*1024//granularity)*granularity)
+                    offset = 0
+                    while offset < len(payload):
+                        chunk = payload[offset:offset+chunk_size]
+                        final = offset+len(chunk) == len(payload)
+                        with photos_request("POST",url,data=chunk,headers={"Content-Type":"application/octet-stream","X-Goog-Upload-Offset":str(offset),"X-Goog-Upload-Command":"upload, finalize" if final else "upload"},timeout=300) as response:
+                            response.raise_for_status()
+                            if final:
+                                return response.text
+                        offset += len(chunk)
+                    raise ValueError("Empty video")
+                except (ConnectionError, Timeout, HTTPError) as exc:
+                    if isinstance(exc, HTTPError) and exc.response is not None and exc.response.status_code not in (408,429,500,502,503,504):
+                        raise
+                    if attempt == 2:
+                        raise
+                    time.sleep(2**attempt)
+        for attempt in range(3):
+            try:
+                with photos_request("POST",BASE+"uploads",data=payload,headers=headers,timeout=300) as response:
+                    response.raise_for_status()
+                    return response.text
+            except (ConnectionError, Timeout, HTTPError) as exc:
+                if isinstance(exc, HTTPError) and exc.response is not None and exc.response.status_code not in (408,429,500,502,503,504):
+                    raise
+                if attempt == 2:
+                    raise
+                time.sleep(2**attempt)
+
     def listing(q):
         page = None
         while True:
@@ -247,6 +302,12 @@ def main():
             if m == FOLDER:
                 yield from walk(f["id"])
             elif m.startswith("image/") or (m.startswith("video/") and c["photos"].getboolean("include_videos", True)):
+                yield f
+            elif c["photos"].getboolean("include_videos", True) and f["name"].lower().endswith((".mp4",".m4v",".mov",".avi",".mkv",".webm",".3gp",".mpg",".mpeg")) and not m.startswith("application/vnd.google-apps."):
+                import mimetypes
+                f = dict(f)
+                f["mimeType"] = mimetypes.guess_type(f["name"])[0] or "video/mp4"
+                print(f["name"], "video detected by extension; Drive MIME:", m, flush=True)
                 yield f
     db.execute("CREATE TABLE IF NOT EXISTS verified_source (source_id TEXT PRIMARY KEY, version TEXT, remote TEXT, policy INTEGER, kind TEXT)")
     db.commit()
@@ -307,13 +368,20 @@ def main():
                         totals["verified"] += 1
                         print(year, name, "verified from checkpoint")
                         continue
+                    if f["mimeType"].startswith("video/"):
+                        item = api("GET", "mediaItems/" + remote)
                     if f["mimeType"].startswith("video/") and item.get("mediaMetadata", {}).get("video", {}).get("status") != "READY":
                         raise ValueError("Video not ready; retained for next run")
                     before = {k: totals[k] for k in ("exact", "pixel_match", "processed", "video_stream_match")}
                     digest = hashlib.md5()
                     suffix = "=dv" if f["mimeType"].startswith("video/") else "=d"
                     with tempfile.TemporaryFile() as dest:
-                        with photos_request("GET", item["baseUrl"] + suffix, stream=True, timeout=300) as response:
+                        response = photos_request("GET", item["baseUrl"] + suffix, stream=True, timeout=300)
+                        if response.status_code in (400,403,404):
+                            response.close()
+                            item = api("GET", "mediaItems/" + remote)
+                            response = photos_request("GET", item["baseUrl"] + suffix, stream=True, timeout=300)
+                        with response:
                             response.raise_for_status()
                             for chunk in response.iter_content(1024 * 1024):
                                 digest.update(chunk)
@@ -349,7 +417,7 @@ def main():
                                         print(year, name, "fallback: processed image accepted; pixels or metadata may differ")
                                     else:
                                         raise ValueError("Image pixels differ; retained")
-                        elif f["mimeType"] == "video/mp4":
+                        elif f["mimeType"].startswith("video/"):
                             with tempfile.TemporaryDirectory() as work:
                                 source_path = os.path.join(work, "source.mp4")
                                 dest_path = os.path.join(work, "destination.mp4")
@@ -365,7 +433,9 @@ def main():
                                 with open(dest_path, "wb") as out:
                                     shutil.copyfileobj(dest, out)
                                 if video_stream_hash(source_path) != video_stream_hash(dest_path):
-                                    raise ValueError("Video stream hashes or timing differ; retained")
+                                    if decoded_video_hash(source_path) != decoded_video_hash(dest_path):
+                                        raise ValueError("Decoded video/audio or timing differs; retained")
+                                    print(year, name, "fallback: exact decoded frames and audio")
                                 totals["video_stream_match"] += 1
                                 print(year, name, "fallback: matching encoded video/audio streams")
                         else:
@@ -553,23 +623,17 @@ def main():
                             raise ValueError("Invalid JPEG")
                         comment = ("google-picture-sync recovery " + uuid.uuid4().hex).encode("ascii")
                         payload = original[:2] + b"\xff\xfe" + (len(comment)+2).to_bytes(2,"big") + comment + original[2:]
-                    r = photos_request("POST", BASE+"uploads", data=payload, headers={"Content-Type":"application/octet-stream","X-Goog-Upload-Protocol":"raw","X-Goog-Upload-Content-Type":f["mimeType"]}, timeout=300)
-                    for retry in range(3):
-                        if r.status_code not in (429, 500, 502, 503, 504):
-                            break
-                        time.sleep(2 ** retry)
-                        r = photos_request("POST", BASE+"uploads", data=payload, headers={"Content-Type":"application/octet-stream","X-Goog-Upload-Protocol":"raw","X-Goog-Upload-Content-Type":f["mimeType"]}, timeout=300)
-                    r.raise_for_status()
+                    upload_token = upload_payload(payload, f["mimeType"])
                     if not recovering:
                         if not batch:
                             batch_started = time.monotonic()
-                        batch.append((id,name,r.text))
+                        batch.append((id,name,upload_token))
                         if len(batch) >= 50:
                             flush_batch()
                         break
                     db.execute("INSERT OR REPLACE INTO media VALUES (?,?,?,?,?,?)",(id,year,name,"pending",None,None))
                     db.commit()
-                    result = api("POST","mediaItems:batchCreate",json={"albumId":album,"newMediaItems":[{"simpleMediaItem":{"uploadToken":r.text,"fileName":name}}]})["newMediaItemResults"][0]
+                    result = api("POST","mediaItems:batchCreate",json={"albumId":album,"newMediaItems":[{"simpleMediaItem":{"uploadToken":upload_token,"fileName":name}}]})["newMediaItemResults"][0]
                     if result.get("status",{}).get("code",0):
                         db.execute("UPDATE media SET status='failed',error=? WHERE id=?", (str(result["status"].get("code")),id))
                         db.commit()
