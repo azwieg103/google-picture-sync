@@ -190,3 +190,14 @@ The wrapper uploads, verifies and moves eligible originals to Drive Trash. Keep 
 ## Video recovery
 
 Videos are discovered by Drive MIME type or recognized filename extension, including MP4/HEVC, MOV and M4V. Video uploads use the resumable protocol in chunks; interrupted sessions are restarted with bounded retries (not persisted across processes). Verification refreshes video metadata and retries expired download URLs. Install ffmpeg and ffprobe for encoded stream and exact decoded frame/audio comparisons. Lossy transcoding that changes decoded content is not accepted for automatic trash; originals remain in Drive. Retry failed uploads with the normal yearly wrapper. Pending uncertain media creation records are retained for review. Video data is currently buffered in memory before upload.
+
+
+### Processed video cleanup
+
+After installing the updated package, run:
+
+```bash
+.venv/bin/google-picture-sync --cleanup --year 2016 --accept-processed --accept-processed-video
+```
+
+This explicitly permits transcoded video cleanup when duration, geometry, frame rate, frame counts, full-frame SSIM (minimum 0.95, mean 0.98), and exact decoded audio (if present) pass. Original quality and metadata are not guaranteed. Files failing any check remain in Drive. Download failures are retried with refreshed URLs. FFmpeg and ffprobe are required. The normal migration wrapper does not enable this option automatically.
