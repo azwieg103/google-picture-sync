@@ -185,3 +185,8 @@ bash migrate.sh 2026
 ```
 
 The wrapper uploads, verifies and moves eligible originals to Drive Trash. Keep Trash until results are reviewed. For upload only, use `--year 2026` directly.
+
+
+## Video recovery
+
+Videos are discovered by Drive MIME type or recognized filename extension, including MP4/HEVC, MOV and M4V. Video uploads use the resumable protocol in chunks; interrupted sessions are restarted with bounded retries (not persisted across processes). Verification refreshes video metadata and retries expired download URLs. Install ffmpeg and ffprobe for encoded stream and exact decoded frame/audio comparisons. Lossy transcoding that changes decoded content is not accepted for automatic trash; originals remain in Drive. Retry failed uploads with the normal yearly wrapper. Pending uncertain media creation records are retained for review. Video data is currently buffered in memory before upload.
