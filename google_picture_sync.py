@@ -110,6 +110,7 @@ def main():
     p.add_argument("--limit", type=int, default=0, help="Maximum new uploads this run (0 unlimited)")
     p.add_argument("--accept-processed", action="store_true", help="Allow processed images with matching dimensions and recorded upload ID even if pixels differ")
     p.add_argument("--accept-processed-video", action="store_true", help="Opt in to conservative processed video verification; original quality may differ")
+    p.add_argument("--videos-only", action="store_true", help="Restrict migration and verification to videos")
     a = p.parse_args()
     if a.accept_processed_video and not a.cleanup:
         p.error("--accept-processed-video requires --cleanup")
@@ -356,6 +357,10 @@ def main():
                 f["mimeType"] = mimetypes.guess_type(f["name"])[0] or "video/mp4"
                 print(f["name"], "video detected by extension; Drive MIME:", m, flush=True)
                 yield f
+    def selected_walk(id):
+        for f in walk(id):
+            if not a.videos_only or f["mimeType"].startswith("video/"):
+                yield f
     db.execute("CREATE TABLE IF NOT EXISTS verified_source (source_id TEXT PRIMARY KEY, version TEXT, remote TEXT, policy INTEGER, kind TEXT)")
     db.commit()
     db.execute("CREATE TABLE IF NOT EXISTS completed_year (year TEXT PRIMARY KEY)")
@@ -374,8 +379,13 @@ def main():
         if a.year and len(folders) != 1:
             p.error("Expected exactly one source year folder")
         for folder in folders:
-            for f in walk(folder["id"]):
+            for f in selected_walk(folder["id"]):
                 inventory[(folder["name"], f["id"])] = f
+        if a.videos_only:
+            rows = [row for row in rows if (row[0], row[1]) in inventory]
+            if not inventory:
+                print("No remaining source videos")
+                return 0
         if a.year and not inventory and db.execute("SELECT 1 FROM completed_year WHERE year=?", (str(a.year),)).fetchone():
             print(a.year, "already completed; source inventory empty")
             return 0
@@ -551,7 +561,7 @@ def main():
                     totals["folders_trashed"] += 1
                     print(a.year, child["name"], "empty folder trashed")
             prune_empty(folders[0]["id"])
-            if not remaining and not totals["unverified"]:
+            if not a.videos_only and not remaining and not totals["unverified"]:
                 db.execute("INSERT OR IGNORE INTO completed_year VALUES (?)", (str(a.year),))
                 db.commit()
         print("Verification summary:", totals)
@@ -610,7 +620,7 @@ def main():
             batch.clear()
             batch_started = None
         print(year, "scanning source media", flush=True)
-        for f in walk(folder["id"]):
+        for f in selected_walk(folder["id"]):
             id, name = f["id"], f["name"]
             row = db.execute("SELECT status,remote FROM media WHERE id=?", (id,)).fetchone()
             if a.scan or a.dry_run:
