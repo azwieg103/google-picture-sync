@@ -133,12 +133,18 @@ def main():
     p.add_argument("--accept-processed-video", action="store_true", help="Opt in to conservative processed video verification; original quality may differ")
     p.add_argument("--videos-only", action="store_true", help="Restrict migration and verification to videos")
     p.add_argument("--accept-unverified-video", action="store_true", help="Accept playable uploaded videos with matching duration, resolution and stream counts; content identity is not guaranteed")
+    p.add_argument("--folder", help="Migrate a named direct child of the Pictures folder")
     a = p.parse_args()
+    if a.folder:
+        if a.year or a.create_albums or any((a.init,a.auth,a.test,a.status)):
+            p.error("--folder cannot be combined with --year, --create-albums, --init, --auth, --test or --status")
+        if not a.folder.strip() or re.fullmatch(r"\d{4}", a.folder):
+            p.error("Use --year for yearly folders; --folder requires a non-year name")
     if a.accept_unverified_video and not a.cleanup:
         p.error("--accept-unverified-video requires --cleanup")
     if a.accept_processed_video and not a.cleanup:
         p.error("--accept-processed-video requires --cleanup")
-    if not any((a.init, a.auth, a.test, a.scan, a.dry_run, a.all, a.resume, a.status, a.retry_failed, a.verify, a.cleanup, a.create_albums, a.year)):
+    if not any((a.init, a.auth, a.test, a.scan, a.dry_run, a.all, a.resume, a.status, a.retry_failed, a.verify, a.cleanup, a.create_albums, a.year, a.folder)):
         p.error("Specify an action or --year")
     if a.year is not None and not 1000 <= a.year <= 9999:
         p.error("--year must be a four-digit year")
@@ -153,8 +159,8 @@ def main():
         if not 1000 <= first <= last <= 9999 or last-first > 100:
             p.error("Specify an ascending range of at most 101 four-digit years")
         album_years = [str(y) for y in range(first,last+1)]
-    if a.cleanup and not a.year:
-        p.error("--cleanup requires --year")
+    if a.cleanup and not (a.year or a.folder):
+        p.error("--cleanup requires --year or --folder")
     if a.limit < 0:
         p.error("--limit must be nonnegative")
     path = Path(a.config)
@@ -368,6 +374,11 @@ def main():
         api("GET", "albums", params={"pageSize":1})
         print("Photos album read successful; no upload tested")
         return
+    selection = a.folder or (str(a.year) if a.year else None)
+    def selected_folder(f):
+        return f["mimeType"] == FOLDER and (f["name"] == selection if selection else bool(re.fullmatch(r"\d{4}", f["name"])))
+    if a.folder and len([f for f in children(root) if selected_folder(f)]) != 1:
+        p.error("Expected exactly one named source folder")
     def walk(id):
         for f in children(id):
             m = f["mimeType"]
@@ -393,14 +404,14 @@ def main():
         totals = {"verified": 0, "unverified": 0, "trashed": 0, "exact": 0, "pixel_match": 0, "processed": 0, "folders_trashed": 0, "video_stream_match": 0, "processed_video": 0, "migration_video": 0}
         query = "SELECT year,id,name,status,remote FROM media"
         args = ()
-        if a.year:
+        if selection:
             query += " WHERE year=?"
-            args = (str(a.year),)
+            args = (selection,)
         rows = list(db.execute(query, args))
         records = {(year, source_id): (status, remote) for year, source_id, name, status, remote in rows}
         inventory = {}
-        folders = [f for f in children(root) if f["mimeType"] == FOLDER and re.fullmatch(r"\d{4}", f["name"]) and (not a.year or f["name"] == str(a.year))]
-        if a.year and len(folders) != 1:
+        folders = [f for f in children(root) if selected_folder(f)]
+        if selection and len(folders) != 1:
             p.error("Expected exactly one source year folder")
         for folder in folders:
             for f in selected_walk(folder["id"]):
@@ -410,8 +421,8 @@ def main():
             if not inventory:
                 print("No remaining source videos")
                 return 0
-        if a.year and not inventory and db.execute("SELECT 1 FROM completed_year WHERE year=?", (str(a.year),)).fetchone():
-            print(a.year, "already completed; source inventory empty")
+        if selection and not inventory and db.execute("SELECT 1 FROM completed_year WHERE year=?", (selection,)).fetchone():
+            print(selection, "already completed; source inventory empty")
             return 0
         memberships = {}
         candidates = []
@@ -565,10 +576,10 @@ def main():
                 result = drive.files().update(fileId=f["id"], body={"trashed": True}, fields="id,trashed").execute()
                 if not result.get("trashed"):
                     p.error("Trash operation not confirmed")
-                db.execute("INSERT OR REPLACE INTO cleanup_history(source_id,year,remote) VALUES (?,?,?)", (f["id"],str(a.year),records[(str(a.year),f["id"])][1]))
+                db.execute("INSERT OR REPLACE INTO cleanup_history(source_id,year,remote) VALUES (?,?,?)", (f["id"],selection,records[(selection,f["id"])][1]))
                 db.commit()
                 totals["trashed"] += 1
-                print(a.year, f["name"], "trashed")
+                print(selection, f["name"], "trashed")
             remaining = list(walk(folders[0]["id"]))
             print("Source media remaining:", len(remaining))
             def prune_empty(parent):
@@ -587,10 +598,10 @@ def main():
                     if not result.get("trashed"):
                         p.error("Empty folder trash operation not confirmed")
                     totals["folders_trashed"] += 1
-                    print(a.year, child["name"], "empty folder trashed")
+                    print(selection, child["name"], "empty folder trashed")
             prune_empty(folders[0]["id"])
             if not a.videos_only and not remaining and not totals["unverified"]:
-                db.execute("INSERT OR IGNORE INTO completed_year VALUES (?)", (str(a.year),))
+                db.execute("INSERT OR IGNORE INTO completed_year VALUES (?)", (selection,))
                 db.commit()
         print("Verification summary:", totals)
         db.close()
@@ -599,7 +610,7 @@ def main():
     print("Scanning source year folders", flush=True)
     for folder in sorted(children(root), key=lambda f:f["name"]):
         year = folder["name"]
-        if folder["mimeType"] != FOLDER or not re.fullmatch(r"\d{4}", year) or (a.year and year != str(a.year)):
+        if not selected_folder(folder):
             continue
         if not (a.scan or a.dry_run) and db.execute("SELECT 1 FROM completed_year WHERE year=?", (year,)).fetchone() and not any(walk(folder["id"])):
             print(year, "already completed; source inventory empty")
